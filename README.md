@@ -40,3 +40,12 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Citation
 If you use this code, please cite:
+
+"Causin, G. (2025). Can Weather Derivatives Be an Effective Tool for Managing Weather Risk in Swiss Agriculture?
+Bachelor Thesis, University of St. Gallen."
+
+## Contact
+giordano.causin@student.unisg.ch
+
+
+
