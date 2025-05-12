@@ -1,0 +1,5 @@
+"Contract","TriggerProbability","MaxPayoutProbability","AvgPayoutWhenTriggered"
+"HDD Contract",1,4e-04,3590.31138539793
+"CDD Contract",0.8343,0,778.346102859739
+"Either Contract",1,NA,4239.68553901381
+"Both Contracts",0.8343,NA,4376.55862608776

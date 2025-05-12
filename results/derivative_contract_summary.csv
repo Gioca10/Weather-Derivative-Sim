@@ -1,0 +1,4 @@
+"Contract","Period","StrikeLevel","TickSize","FairPrice","EffectivePrice","AveragePayout","MaxPayout","ExpectedPayoffRatio","YieldLossCorrelation"
+"HDD Contract (Cold)","Mar 15 - Apr 30","10 °C (below)","50 CHF/HDD",3532.25884508868,2825.80707607094,3590.31138539793,12000,1.01643496211779,0.637079565189301
+"CDD Contract (Heat)","May 10 - Jun 25","22 °C (above)","75 CHF/CDD",633.992075869298,507.193660695438,649.374153615881,20000,1.0242622555266,-0.0965368708137188
+"Combined Portfolio","Combined","Multiple","Multiple",4166.25092095797,3333.00073676638,4239.68553901381,32000,1.01762606704422,0.539089943832112

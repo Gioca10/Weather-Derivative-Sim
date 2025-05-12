@@ -1,0 +1,6 @@
+"Threshold","AnnualDaysAbove","MaxConsecutiveDays","MonthlyDistribution","CriticalPeriodDays"
+22,16.5276,6.6505,"Jul: 7, Jun: 5.1, Aug: 2.8",5.1906
+24,5.716,3.0816,"Jul: 2.7, Jun: 1.8, Aug: 0.8",1.6735
+26,1.4985,1.0802,"Jul: 0.8, Jun: 0.5, Aug: 0.2",0.3997
+28,0.2963,0.252299999999999,"Jul: 0.2, Jun: 0.1, Aug: 0",0.071
+30,0.0402000000000002,0.0364999999999999,"Jul: 0, Jun: 0, Aug: 0",0.0101
