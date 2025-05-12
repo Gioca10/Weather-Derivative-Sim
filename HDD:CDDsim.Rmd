@@ -1,0 +1,2993 @@
+---
+title: "Weather Simulation"
+author: "Giordano Causin"
+date: "2025-04-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r user parameters}
+# ========== USER CONFIGURATION ==========
+# Set working directory if needed
+# setwd("/path/to/your/directory")
+
+# Required libraries
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(stats)
+library(ggplot2)
+library(reshape2)
+library(gridExtra) 
+
+# File path to temperature data
+TEMP_DATA_FILE <- "temperature_data.xlsx" 
+
+# Set number of simulation paths
+N_SIMULATION_PATHS <- 10000
+
+# Base temperatures for degree day calculations
+HDD_BASE_TEMP <- 18  
+CDD_BASE_TEMP <- 18
+
+# Initial temperature for simulation start
+INITIAL_TEMP <- 1
+
+# Risk-free rate for pricing
+RISK_FREE_RATE <- 0.05
+
+# Visualization settings
+N_PATHS_TO_PLOT <- 10  # Number of individual paths to show in plot
+
+# Simulation period
+SIM_START_DATE <- as.Date("2026-01-01")
+SIM_END_DATE <- as.Date("2026-12-31")
+
+# Random seed for reproducibility
+set.seed(9)
+
+# ========== WHEAT GROWTH MODEL CONFIGURATION ==========
+# Define wheat growth parameters
+WHEAT_BASE_YIELD <- 6.0       # Base yield in tons per hectare
+OPTIMAL_TEMP_MIN <- 15        # Lower bound of optimal temperature range (°C)
+OPTIMAL_TEMP_MAX <- 25        # Upper bound of optimal temperature range (°C)
+HEAT_STRESS_THRESHOLD <- 30   # Temperature above which heat stress occurs (°C)
+FROST_THRESHOLD <- 0          # Temperature below which frost damage occurs (°C)
+
+# Define phenological stages with their respective durations and temperature sensitivities
+# For wheat, typical stages are: germination, tillering, stem extension, heading, anthesis, grain filling
+WHEAT_STAGES <- list(
+  germination = list(
+    days = 15,                
+    temp_sensitivity = 0.5,   
+    opt_temp_min = 10,        
+    opt_temp_max = 20
+  ),
+  tillering = list(
+    days = 30,
+    temp_sensitivity = 0.7,   
+    opt_temp_min = 12,
+    opt_temp_max = 22
+  ),
+  stem_extension = list(
+    days = 25,
+    temp_sensitivity = 0.8,   
+    opt_temp_min = 14,
+    opt_temp_max = 24
+  ),
+  heading = list(
+    days = 10,
+    temp_sensitivity = 0.9,   
+    opt_temp_min = 15,
+    opt_temp_max = 25
+  ),
+  anthesis = list(
+    days = 7,                 # Flowering is a critical short period
+    temp_sensitivity = 1.5,   # Higher sensitivity during critical flowering period
+    opt_temp_min = 16,
+    opt_temp_max = 24         # Narrower optimal range during flowering
+  ),
+  grain_filling = list(
+    days = 30,
+    temp_sensitivity = 1.0,   
+    opt_temp_min = 15,
+    opt_temp_max = 25
+  ),
+  maturation = list(
+    days = 15,
+    temp_sensitivity = 0.6,   
+    opt_temp_min = 18,
+    opt_temp_max = 28         # Higher temperature tolerance during maturation
+  )
+)
+
+# Define parameters for the stress response functions
+HEAT_STRESS_SLOPE <- 0.10      # Yield reduction per degree above threshold
+FROST_STRESS_SLOPE <- 0.15    # Yield reduction per degree below threshold
+
+# Define planting date (day of year)
+PLANTING_DAY <- 60            # Approximately March 1st
+
+# ========== ECONOMIC MODEL CONFIGURATION ==========
+# Economic parameters
+WHEAT_PRICE_PER_TON <- 250           # Price of wheat in CHF per ton
+PRODUCTION_COST_PER_HECTARE <- 500   # Fixed costs of production per hectare
+FARM_SIZE_HECTARES <- 20             # Size of the farm in hectares
+
+# ========== WEATHER DERIVATIVE PARAMETERS ==========
+# HDD Contract for cold protection during early growth
+HDD_CONTRACT_START <- as.Date("2026-03-15")     # Early growth stage
+HDD_CONTRACT_END <- as.Date("2026-04-30")       # Cover tillering and early stem extension
+HDD_STRIKE <- 10                                # HDD strike temperature (°C)
+HDD_TICK_SIZE <- 50                             # Payout per HDD ($/HDD)
+HDD_MAX_PAYOUT <- 12000                         # Maximum payout ($)
+
+# CDD Contract for heat protection during anthesis/grain filling
+CDD_CONTRACT_START <- as.Date("2026-05-10")     # Around anthesis and grain filling
+CDD_CONTRACT_END <- as.Date("2026-06-25")       # End of critical growth period
+CDD_STRIKE <- 22                                # CDD strike temperature (°C)
+CDD_TICK_SIZE <- 75                             # Payout per CDD ($/CDD)
+CDD_MAX_PAYOUT <- 20000                         # Maximum payout ($)
+
+# Hedge ratio (proportion of potential loss covered by derivative)
+HEDGE_RATIO <- 0.8                            # Set to value between 0 and 1
+```
+
+```{r functions}
+# Temperature Data Processing Functions
+#' Load and preprocess Swiss temperature data
+#' 
+#' @param file_path Path to the Excel file with temperature data
+#' @return A data frame with dates and temperatures
+load_temperature_data <- function(file_path) {
+  # Read the Excel file starting from row 5
+  temp_data <- read_excel(file_path, skip = 4)
+  
+  # Rename the first two columns for clarity
+  names(temp_data)[1:2] <- c("date_string", "temperature")
+  
+  # Parse the date using the correct format DD.MM.YYYY
+  temp_data$date <- as.Date(temp_data$date_string, format="%d.%m.%Y")
+  
+  # Select only the columns we need
+  temp_data <- temp_data %>% select(date, temperature)
+  
+  # Return the data
+  return(temp_data)
+}
+
+#' Calculate day of year (1-366) from date
+#' 
+#' @param dates Vector of Date objects
+#' @return Vector of day-of-year numbers
+day_of_year <- function(dates) {
+  return(as.numeric(format(dates, "%j")))
+}
+
+# Parameter Estimation Functions
+#' Estimate seasonal mean parameters (A, B, C, phi) from temperature data
+#' 
+#' @param data Data frame with date and temperature columns
+#' @return List with estimated parameters
+estimate_seasonal_mean <- function(temp_data) {
+  # Calculate number of days since Jan 1, 1970
+  temp_data$days_since_1970 <- as.numeric(temp_data$date - as.Date("1970-01-01"))
+  
+  # Calculate day of year (1-366)
+  temp_data$day_of_year <- day_of_year(temp_data$date)
+  
+  # Create temporal variables for fitting
+  omega <- 2 * pi / 365
+  temp_data$t <- temp_data$days_since_1970
+  
+  # Use negative sine to match simulation function
+  temp_data$sin_term <- -sin(omega * temp_data$day_of_year)
+  temp_data$cos_term <- -cos(omega * temp_data$day_of_year)
+  
+  # Fit linear model with negative sine/cosine terms
+  model <- lm(temperature ~ t + sin_term + cos_term, temp_data)
+  
+  # Extract parameters
+  A <- coef(model)[1]
+  B <- coef(model)[2]
+  C1 <- coef(model)[3]
+  C2 <- coef(model)[4]
+  
+  # Calculate C and phi (adjusting for negative sine/cosine)
+  C <- sqrt(C1^2 + C2^2)
+  phi <- atan2(C2, C1)  # Changed from atan2(-C2, C1)
+  
+  # Return parameters
+  return(list(
+    A = A,
+    B = B,
+    C = C,
+    phi = phi,
+    model = model
+  ))
+}
+
+#' Estimate mean reversion parameter (a) using residuals
+#' 
+#' @param data Data frame with date and temperature columns
+#' @param mean_params List with mean parameters
+#' @return Estimated mean reversion parameter
+estimate_mean_reversion <- function(temp_data, mean_params) {
+  # Calculate seasonal mean temperatures
+  omega <- 2 * pi / 365
+  temp_data$days_since_1970 <- as.numeric(temp_data$date - as.Date("1970-01-01"))
+  temp_data$day_of_year <- day_of_year(temp_data$date)
+  
+  temp_data$mean_temp <- with(mean_params,
+                         A + B * temp_data$days_since_1970 - 
+                           C * sin(omega * temp_data$day_of_year + phi))
+  
+  # Calculate residuals (deviations from mean)
+  temp_data$residual <- temp_data$temperature - temp_data$mean_temp
+  
+  # Create lagged residuals
+  temp_data <- temp_data %>%
+    arrange(date) %>%
+    mutate(residual_lag = lag(residual))
+  
+  # Remove NA rows
+  temp_data <- temp_data %>% filter(!is.na(residual_lag))
+  
+  # Fit AR(1) model without intercept
+  ar_model <- lm(residual ~ 0 + residual_lag, temp_data)
+  
+  # The coefficient is e^(-a), so solve for a
+  ar_coef <- coef(ar_model)[1]
+  a <- -log(ar_coef)
+  
+  return(a)
+}
+
+#' Estimate monthly volatility parameters
+#' 
+#' @param data Data frame with date and temperature columns
+#' @param mean_params Mean parameters
+#' @param a Mean reversion parameter
+#' @return Vector of 12 monthly volatility parameters
+estimate_volatility <- function(temp_data, mean_params, a) {
+  # Calculate seasonal mean temperatures
+  omega <- 2 * pi / 365
+  temp_data$days_since_1970 <- as.numeric(temp_data$date - as.Date("1970-01-01"))
+  temp_data$day_of_year <- day_of_year(temp_data$date)
+  
+  temp_data$mean_temp <- with(mean_params,
+                         A + B * temp_data$days_since_1970 - 
+                           C * sin(omega * temp_data$day_of_year + phi))
+  
+  # Calculate residuals
+  temp_data$residual <- temp_data$temperature - temp_data$mean_temp
+  
+  # Get month
+  temp_data$month <- month(temp_data$date)
+  
+  # Create lagged data
+  temp_data <- temp_data %>%
+    arrange(date) %>%
+    mutate(
+      temp_lag = lag(temperature),
+      mean_temp_lag = lag(mean_temp),
+      residual_lag = lag(residual),
+      date_lag = lag(date)
+    )
+  
+  # Remove NA rows
+  temp_data <- temp_data %>% filter(!is.na(temp_lag))
+  
+  # Calculate daily changes
+  temp_data$days_diff <- as.numeric(temp_data$date - temp_data$date_lag)
+  
+  # Only keep rows where the difference is 1 day
+  temp_data <- temp_data %>% filter(days_diff == 1)
+  
+  # Calculate expected change based on model
+  temp_data$expected_change <- temp_data$mean_temp - temp_data$temp_lag * exp(-a) - 
+                          temp_data$mean_temp_lag * (1 - exp(-a))
+  
+  # Calculate unexpected change (innovation)
+  temp_data$innovation <- temp_data$temperature - temp_data$temp_lag * exp(-a) - 
+                    temp_data$mean_temp_lag * (1 - exp(-a))
+  
+  # Calculate variance by month
+  monthly_variance <- temp_data %>%
+    group_by(month) %>%
+    summarize(
+      variance = var(innovation),
+      n = n()
+    )
+  
+  # Convert to standard deviation (sigma)
+  # According to Alaton, σ_i = sqrt(variance_i)
+  sigma_monthly <- sqrt(monthly_variance$variance)
+  
+  return(sigma_monthly)
+}
+
+#' Estimate all parameters for Alaton weather model
+#' 
+#' @param file_path Path to Excel file with temperature data
+#' @return List with all estimated parameters
+estimate_alaton_parameters <- function(file_path) {
+  # Load data
+  temp_data <- load_temperature_data(file_path)
+  
+  # Estimate seasonal mean parameters
+  cat("\nEstimating seasonal mean parameters...\n")
+  mean_params <- estimate_seasonal_mean(temp_data)
+  
+  # Estimate mean reversion parameter
+  cat("Estimating mean reversion parameter...\n")
+  a <- estimate_mean_reversion(temp_data, mean_params)
+  
+  # Estimate monthly volatility parameters
+  cat("Estimating monthly volatility parameters...\n")
+  sigma_monthly <- estimate_volatility(temp_data, mean_params, a)
+  
+  # Combine all parameters
+  parameters <- list(
+    A = mean_params$A,
+    B = mean_params$B,
+    C = mean_params$C,
+    phi = mean_params$phi,
+    a = a,
+    sigma_monthly = sigma_monthly
+  )
+  
+  # Print the parameters in a nicely formatted way
+  cat("\n========== ESTIMATED MODEL PARAMETERS ==========\n")
+  cat("A (base level):", round(parameters$A, 4), "°C\n")
+  cat("B (trend):", round(parameters$B, 8), "°C/day\n")
+  cat("C (amplitude):", round(parameters$C, 4), "°C\n")
+  cat("phi (phase):", round(parameters$phi, 4), "radians\n")
+  cat("a (mean reversion):", round(parameters$a, 4), "1/day\n")
+  
+  cat("Monthly volatilities (sigma):\n")
+  month_names <- month.abb  # Jan, Feb, Mar, etc.
+  for (i in 1:12) {
+    cat("  ", month_names[i], ": ", round(parameters$sigma_monthly[i], 4), "°C\n", sep="")
+  }
+  cat("==============================================\n")
+  
+  return(parameters)
+}
+
+# Visualization Functions
+#' Plot temperature data with estimated seasonal mean
+#' 
+#' @param data Data frame with date and temperature columns
+#' @param mean_params Estimated mean parameters
+#' @param sample_years Number of years to sample for plot
+#' @return ggplot object
+plot_temperature_fit <- function(temp_data, mean_params, sample_years = 2) {
+  # Calculate seasonal mean temperatures
+  omega <- 2 * pi / 365
+  temp_data$days_since_1970 <- as.numeric(temp_data$date - as.Date("1970-01-01"))
+  temp_data$day_of_year <- day_of_year(temp_data$date)
+  
+  temp_data$mean_temp <- with(mean_params,
+                         A + B * temp_data$days_since_1970 - 
+                           C * sin(omega * temp_data$day_of_year + phi))
+  
+  # Sample a subset of the data for plotting
+  # Use last N years of data
+  plot_data <- temp_data %>%
+    filter(date >= max(date) - years(sample_years))
+  
+  # Create plot
+  ggplot(plot_data, aes(x = date)) +
+    geom_point(aes(y = temperature), alpha = 0.3, color = "darkgrey") +
+    geom_line(aes(y = mean_temp), color = "red", size = 1) +
+    labs(title = "Temperature with Fitted Seasonal Mean",
+         subtitle = paste("Last", sample_years, "years of historical data"),
+         x = "Date", y = "Temperature (°C)") +
+    theme_minimal()
+}
+
+#' Plot residuals after removing seasonal mean
+#' 
+#' @param temp_data Data frame with date and temperature columns
+#' @param mean_params Estimated mean parameters
+#' @param sample_years Number of years to sample for plot
+#' @return ggplot object
+plot_residuals <- function(temp_data, mean_params, sample_years = 2) {
+  # Calculate seasonal mean temperatures
+  omega <- 2 * pi / 365
+  temp_data$days_since_1970 <- as.numeric(temp_data$date - as.Date("1970-01-01"))
+  temp_data$day_of_year <- day_of_year(temp_data$date)
+  
+  temp_data$mean_temp <- with(mean_params,
+                         A + B * temp_data$days_since_1970 - 
+                           C * sin(omega * temp_data$day_of_year + phi))
+  
+  # Calculate residuals
+  temp_data$residual <- temp_data$temperature - temp_data$mean_temp
+  
+  # Sample a subset of the data for plotting
+  # Use last N years of data
+  plot_data <- temp_data %>%
+    filter(date >= max(date) - years(sample_years))
+  
+  # Create plot
+  ggplot(plot_data, aes(x = date, y = residual)) +
+    geom_line(alpha = 0.7) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    labs(title = "Temperature Residuals",
+         subtitle = paste("Last", sample_years, "years of historical data"),
+         x = "Date", y = "Residual (°C)") +
+    theme_minimal()
+}
+
+#' Plot monthly volatility
+#' 
+#' @param sigma_monthly Vector of 12 monthly volatility parameters
+#' @return ggplot object
+plot_monthly_volatility <- function(sigma_monthly) {
+  # Create data frame
+  vol_data <- data.frame(
+    Month = month.abb,
+    MonthNum = 1:12,
+    Sigma = sigma_monthly
+  )
+  
+  # Create plot
+  ggplot(vol_data, aes(x = factor(Month, levels = month.abb), y = Sigma)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    geom_text(aes(label = round(Sigma, 2)), vjust = -0.5, size = 3) +
+    labs(title = "Monthly Temperature Volatility",
+         subtitle = "Standard deviation of temperature innovations by month",
+         x = "Month", y = "Volatility (σ)") +
+    theme_minimal()
+}
+
+# Temperature Simulation Functions
+#' Simulate temperature paths using the Ornstein-Uhlenbeck process
+#' with seasonal mean and volatility as described in Alaton et al. paper.
+#' 
+#' @param start_date The start date for simulation (Date object)
+#' @param end_date The end date for simulation (Date object)
+#' @param initial_temp Initial temperature (numeric)
+#' @param A Base temperature parameter (numeric)
+#' @param B Trend parameter (numeric)
+#' @param C Amplitude parameter (numeric)
+#' @param phi Phase angle parameter (numeric)
+#' @param a Mean reversion parameter (numeric)
+#' @param sigma_monthly Monthly volatility parameters (vector of length 12)
+#' @param lambda Market price of risk (numeric)
+#' @param n_paths Number of simulation paths (integer)
+#' @param dt Time step in days (numeric)
+#' @return A list with simulation results
+simulate_temperature <- function(start_date, end_date,
+                                initial_temp,
+                                A, B, C, phi,
+                                a,
+                                sigma_monthly,
+                                lambda = 0,
+                                n_paths = 1,
+                                dt = 1) {
+  
+  # Ensure dates are Date objects
+  start_date <- as.Date(start_date)
+  end_date <- as.Date(end_date)
+  
+  # Generate sequence of dates
+  dates <- seq(start_date, end_date, by = dt)
+  n_days <- length(dates)
+  
+  # Initialize result matrix
+  temp_matrix <- matrix(0, nrow = n_days, ncol = n_paths)
+  temp_matrix[1, ] <- initial_temp
+  
+  # Create day indices for mean calculation
+  day_indices <- as.numeric(dates - as.Date("1970-01-01"))
+  
+  # Precompute mean temperatures
+  omega <- 2 * pi / 365
+  mean_temps <- A + B * day_indices - C * sin(omega * day_indices + phi)
+  
+  # Precompute drift components
+  drift_components <- B - omega * C * cos(omega * day_indices + phi)
+  
+  # Month indices for each date (1-12)
+  months <- as.numeric(format(dates, "%m"))
+  
+  # Loop through each time step
+  for (i in 2:n_days) {
+    # Get current month and sigma
+    current_month <- months[i-1]
+    sigma <- sigma_monthly[current_month]
+    
+    # Compute drift
+    drift <- drift_components[i-1] + a * (mean_temps[i-1] - temp_matrix[i-1, ]) - lambda * sigma
+    
+    # Generate random shocks
+    random_shock <- sigma * sqrt(dt) * rnorm(n_paths)
+    
+    # Euler-Maruyama step
+    temp_matrix[i, ] <- temp_matrix[i-1, ] + drift * dt + random_shock
+  }
+  
+  # Create results list
+  result <- list(
+    dates = dates,
+    temperatures = temp_matrix,
+    mean_temps = mean_temps,
+    parameters = list(
+      A = A, B = B, C = C, phi = phi,
+      a = a, sigma_monthly = sigma_monthly,
+      lambda = lambda
+    )
+  )
+  
+  return(result)
+}
+
+# Degree Day Functions
+#' Calculate HDDs (Heating Degree Days) from temperature data
+#' 
+#' @param temperatures Vector or matrix of temperatures
+#' @param base Base temperature (default uses HDD_BASE_TEMP global variable)
+#' @return Vector or matrix of HDDs
+calculate_hdd <- function(temperatures, base = HDD_BASE_TEMP) {
+  pmax(base - temperatures, 0)
+}
+
+#' Calculate CDDs (Cooling Degree Days) from temperature data
+#' 
+#' @param temperatures Vector or matrix of temperatures
+#' @param base Base temperature (default uses CDD_BASE_TEMP global variable)
+#' @return Vector or matrix of CDDs
+calculate_cdd <- function(temperatures, base = CDD_BASE_TEMP) {
+  pmax(temperatures - base, 0)
+}
+
+#' Calculate accumulated HDDs over a period
+#' 
+#' @param temperatures Vector or matrix of daily temperatures
+#' @param start_idx Starting index for period
+#' @param end_idx Ending index for period
+#' @param base Base temperature for HDD calculation
+#' @return Vector or matrix of accumulated HDDs for the period
+calculate_accumulated_hdd <- function(temperatures, start_idx, end_idx, base = HDD_BASE_TEMP) {
+  if (is.matrix(temperatures)) {
+    # If temperatures is a matrix (multiple paths)
+    period_temps <- temperatures[start_idx:end_idx, , drop = FALSE]
+    daily_hdds <- calculate_hdd(period_temps, base)
+    accumulated_hdds <- colSums(daily_hdds)
+  } else {
+    # If temperatures is a vector (single path)
+    period_temps <- temperatures[start_idx:end_idx]
+    daily_hdds <- calculate_hdd(period_temps, base)
+    accumulated_hdds <- sum(daily_hdds)
+  }
+  
+  return(accumulated_hdds)
+}
+
+#' Calculate accumulated CDDs over a period
+#' 
+#' @param temperatures Vector or matrix of daily temperatures
+#' @param start_idx Starting index for period
+#' @param end_idx Ending index for period
+#' @param base Base temperature for CDD calculation
+#' @return Vector or matrix of accumulated CDDs for the period
+calculate_accumulated_cdd <- function(temperatures, start_idx, end_idx, base = CDD_BASE_TEMP) {
+  if (is.matrix(temperatures)) {
+    # If temperatures is a matrix (multiple paths)
+    period_temps <- temperatures[start_idx:end_idx, , drop = FALSE]
+    daily_cdds <- calculate_cdd(period_temps, base)
+    accumulated_cdds <- colSums(daily_cdds)
+  } else {
+    # If temperatures is a vector (single path)
+    period_temps <- temperatures[start_idx:end_idx]
+    daily_cdds <- calculate_cdd(period_temps, base)
+    accumulated_cdds <- sum(daily_cdds)
+  }
+  
+  return(accumulated_cdds)
+}
+
+#' Plot simulated temperature paths
+#' 
+#' @param sim_result Result from simulate_temperature function
+#' @param n_paths Number of paths to plot (integer)
+#' @param plot_type Type of plot: "all" for all paths, "summary" for quantiles
+#' @return ggplot object
+plot_temperature_paths <- function(sim_result, 
+                                  n_paths = min(10, ncol(sim_result$temperatures)),
+                                  plot_type = "all") {
+  
+  # Extract data
+  dates <- sim_result$dates
+  mean_temps <- sim_result$mean_temps
+  
+  if (plot_type == "all") {
+    # Plot individual paths
+    temps <- sim_result$temperatures[, 1:n_paths, drop = FALSE]
+    
+    # Create data frame for plotting
+    df <- data.frame(Date = dates)
+    df$MeanTemp <- mean_temps
+    
+    for (i in 1:n_paths) {
+      df[paste0("Path", i)] <- temps[, i]
+    }
+    
+    # Reshape data
+    df_melt <- melt(df, id.vars = "Date", variable.name = "Series", value.name = "Temperature")
+    
+    # Plot
+    ggplot(df_melt, aes(x = Date, y = Temperature, color = Series, linetype = Series)) +
+      geom_line() +
+      scale_linetype_manual(values = c("MeanTemp" = "dashed", rep("solid", n_paths))) +
+      scale_color_manual(values = c("MeanTemp" = "red", rainbow(n_paths))) +
+      labs(title = "Simulated Temperature Paths",
+           subtitle = paste(n_paths, "sample paths with seasonal mean"),
+           x = "Date", y = "Temperature (°C)") +
+      theme_minimal()
+  } else {
+    # Plot quantiles
+    all_temps <- sim_result$temperatures
+    n_days <- length(dates)
+    
+    # Calculate quantiles for each day
+    quant_05 <- numeric(n_days)
+    quant_25 <- numeric(n_days)
+    quant_50 <- numeric(n_days)
+    quant_75 <- numeric(n_days)
+    quant_95 <- numeric(n_days)
+    
+    for (i in 1:n_days) {
+      quant_05[i] <- quantile(all_temps[i, ], 0.05)
+      quant_25[i] <- quantile(all_temps[i, ], 0.25)
+      quant_50[i] <- quantile(all_temps[i, ], 0.50)
+      quant_75[i] <- quantile(all_temps[i, ], 0.75)
+      quant_95[i] <- quantile(all_temps[i, ], 0.95)
+    }
+    
+    # Create data frame for plotting
+    df <- data.frame(
+      Date = dates,
+      Mean = mean_temps,
+      Q05 = quant_05,
+      Q25 = quant_25,
+      Q50 = quant_50,
+      Q75 = quant_75,
+      Q95 = quant_95
+    )
+    
+    # Plot
+    ggplot(df, aes(x = Date)) +
+      geom_ribbon(aes(ymin = Q05, ymax = Q95), fill = "skyblue", alpha = 0.3) +
+      geom_ribbon(aes(ymin = Q25, ymax = Q75), fill = "skyblue", alpha = 0.5) +
+      geom_line(aes(y = Q50), color = "blue", size = 0.8) +
+      geom_line(aes(y = Mean), color = "red", linetype = "dashed", size = 0.8) +
+      labs(title = "Temperature Simulation Summary",
+           subtitle = paste("Based on", ncol(all_temps), "simulation paths"),
+           x = "Date", y = "Temperature (°C)",
+           caption = "Blue bands: 50% and 90% confidence intervals; Blue line: median; Red dashed: mean") +
+      theme_minimal()
+  }
+}
+
+#' Plot temperature distribution for specific dates
+#' 
+#' @param sim_result Result from simulate_temperature function
+#' @param dates Vector of dates to plot
+#' @return ggplot object
+plot_temperature_distribution <- function(sim_result, dates = NULL) {
+  if (is.null(dates)) {
+    # Select some dates across the year (quarterly)
+    months <- c(1, 4, 7, 10)
+    first_year <- year(sim_result$dates[1])
+    dates <- as.Date(paste0(first_year, "-", sprintf("%02d", months), "-15"))
+    
+    # Filter to dates that are in the simulation period
+    dates <- dates[dates >= min(sim_result$dates) & dates <= max(sim_result$dates)]
+  }
+  
+  # Find the closest simulation dates
+  plot_dates <- sapply(dates, function(d) {
+    which.min(abs(as.numeric(sim_result$dates - d)))
+  })
+  
+  # Extract temperature distributions for those dates
+  plot_data <- data.frame()
+  for (i in seq_along(plot_dates)) {
+    date_idx <- plot_dates[i]
+    temps <- sim_result$temperatures[date_idx, ]
+    
+    plot_data <- rbind(plot_data, data.frame(
+      Date = format(sim_result$dates[date_idx], "%b %d"),
+      Temperature = temps
+    ))
+  }
+  
+  # Create plot
+  ggplot(plot_data, aes(x = Temperature, fill = Date)) +
+    geom_density(alpha = 0.6) +
+    labs(title = "Temperature Distribution on Selected Dates",
+         x = "Temperature (°C)", y = "Density") +
+    theme_minimal() +
+    facet_wrap(~ Date, ncol = 2)
+}
+
+#' Plot HDD and CDD values for a temperature path
+#' 
+#' @param temperatures Vector of daily temperatures
+#' @param dates Vector of corresponding dates
+#' @param hdd_base Base temperature for HDD calculation (default uses global HDD_BASE_TEMP)
+#' @param cdd_base Base temperature for CDD calculation (default uses global CDD_BASE_TEMP)
+#' @return ggplot object with HDD and CDD plots
+plot_degree_days <- function(temperatures, dates, 
+                           hdd_base = HDD_BASE_TEMP, 
+                           cdd_base = CDD_BASE_TEMP) {
+  
+  # Calculate HDDs and CDDs
+  hdds <- calculate_hdd(temperatures, base = hdd_base)
+  cdds <- calculate_cdd(temperatures, base = cdd_base)
+  
+  # Create data frame for plotting
+  dd_data <- data.frame(
+    Date = dates,
+    Temperature = temperatures,
+    HDD = hdds,
+    CDD = cdds
+  )
+  
+  # Create HDD plot
+  hdd_plot <- ggplot(dd_data, aes(x = Date)) +
+    geom_line(aes(y = Temperature), color = "grey", alpha = 0.5) +
+    geom_area(aes(y = HDD), fill = "blue", alpha = 0.5) +
+    geom_hline(yintercept = hdd_base, linetype = "dashed", color = "blue") +
+    labs(title = paste("Heating Degree Days (Base:", hdd_base, "°C)"),
+         x = "Date", 
+         y = "Temperature (°C) / HDD") +
+    theme_minimal()
+  
+  # Create CDD plot
+  cdd_plot <- ggplot(dd_data, aes(x = Date)) +
+    geom_line(aes(y = Temperature), color = "grey", alpha = 0.5) +
+    geom_area(aes(y = CDD), fill = "red", alpha = 0.5) +
+    geom_hline(yintercept = cdd_base, linetype = "dashed", color = "red") +
+    labs(title = paste("Cooling Degree Days (Base:", cdd_base, "°C)"),
+         x = "Date", 
+         y = "Temperature (°C) / CDD") +
+    theme_minimal()
+  
+  # Return a list of the two plots
+  return(list(hdd_plot = hdd_plot, cdd_plot = cdd_plot))
+}
+
+# Helper function to calculate average temperature for a specific calendar day
+calculate_day_average_temp <- function(temp_data, month, day) {
+  day_data <- temp_data %>%
+    filter(month(date) == month & day(date) == day)
+  
+  avg_temp <- mean(day_data$temperature, na.rm = TRUE)
+  return(avg_temp)
+}
+
+# Wheat Yield Model Functions
+#' Calculate temperature stress effect on wheat yield
+#' 
+#' @param temp Daily temperature (°C)
+#' @param stage Current growth stage
+#' @return Stress factor (0-1, where 1 is no stress)
+calculate_temp_stress <- function(temp, stage) {
+  # Get stage-specific optimal temperature range
+  opt_min <- stage$opt_temp_min
+  opt_max <- stage$opt_temp_max
+  sensitivity <- stage$temp_sensitivity
+  
+  # Initialize stress factor (1 = no stress)
+  stress_factor <- 1.0
+  
+  # Calculate heat stress (high temperature)
+  if (temp > opt_max) {
+    # Linear reduction above optimal maximum
+    heat_stress <- (temp - opt_max) * HEAT_STRESS_SLOPE * sensitivity
+    stress_factor <- stress_factor - heat_stress
+  }
+  
+  # Calculate cold stress (low temperature)
+  if (temp < opt_min) {
+    # Linear reduction below optimal minimum
+    cold_stress <- (opt_min - temp) * FROST_STRESS_SLOPE * sensitivity
+    stress_factor <- stress_factor - cold_stress
+    
+    # Add frost damage component
+    if (temp < FROST_THRESHOLD) {
+      # Severe damage when below freezing
+      frost_damage <- 0.2 * sensitivity  # Additional damage factor
+      stress_factor <- stress_factor * (1 - frost_damage)
+    }
+  }
+  
+  # Ensure stress factor is between 0 and 1
+  stress_factor <- max(0, min(1, stress_factor))
+  
+  return(stress_factor)
+}
+
+#' Determine growth stage based on days after planting
+#' 
+#' @param day_after_planting Days since planting
+#' @param stages List of growth stages with durations
+#' @return Current growth stage information
+get_growth_stage <- function(day_after_planting, stages) {
+  cumulative_days <- 0
+  
+  for (stage_name in names(stages)) {
+    stage <- stages[[stage_name]]
+    cumulative_days <- cumulative_days + stage$days
+    
+    if (day_after_planting <= cumulative_days) {
+      return(list(
+        name = stage_name,
+        data = stage
+      ))
+    }
+  }
+  
+  # If beyond all stages, return the last stage
+  return(list(
+    name = names(stages)[length(stages)],
+    data = stages[[length(stages)]]
+  ))
+}
+
+#' Calculate total growing season length
+#' 
+#' @param stages List of growth stages with durations
+#' @return Total growing season length in days
+get_growing_season_length <- function(stages) {
+  total_days <- 0
+  for (stage in stages) {
+    total_days <- total_days + stage$days
+  }
+  return(total_days)
+}
+
+#' Calculate annual wheat yield based on temperature data for one simulation path
+#' 
+#' @param temps Vector of daily temperatures for one growing season
+#' @param planting_day Day of year when wheat is planted
+#' @param stages List of growth stages with durations
+#' @param base_yield Base yield in tons per hectare
+#' @return Simulated wheat yield
+simulate_annual_wheat_yield <- function(temps, planting_day, stages, base_yield) {
+  # Calculate growing season length
+  growing_season_length <- get_growing_season_length(stages)
+  
+  # Get the temperatures for the growing season
+  season_temps <- temps[planting_day:(planting_day + growing_season_length - 1)]
+  
+  # If season extends beyond available data, handle the edge case
+  if (length(season_temps) < growing_season_length) {
+    warning("Growing season extends beyond available temperature data")
+    # Pad with last available temperatures to complete the season
+    season_temps <- c(season_temps, rep(season_temps[length(season_temps)], 
+                                         growing_season_length - length(season_temps)))
+  }
+  
+  # Calculate daily stress factors
+  daily_stress <- numeric(growing_season_length)
+  # Track stage for each day for weighting
+  daily_stage <- character(growing_season_length)
+  
+  for (day in 1:growing_season_length) {
+    # Determine current growth stage
+    current_stage <- get_growth_stage(day, stages)
+    daily_stage[day] <- current_stage$name
+    
+    # Calculate stress for this day
+    daily_stress[day] <- calculate_temp_stress(season_temps[day], current_stage$data)
+  }
+  
+  # Calculate weights for each day based on growth stage sensitivity
+  stage_weights <- numeric(growing_season_length)
+  for (day in 1:growing_season_length) {
+    # Get current stage
+    current_stage <- get_growth_stage(day, stages)
+    # Set weight based on stage sensitivity
+    stage_weights[day] <- current_stage$data$temp_sensitivity
+  }
+  
+  # Normalize weights to sum to 1
+  stage_weights <- stage_weights / sum(stage_weights)
+  
+  # Calculate weighted stress average
+  weighted_stress <- sum(daily_stress * stage_weights)
+  
+  # Apply non-linear impact - make smaller stresses have larger impact
+  yield_impact <- weighted_stress^1.3  # Exponent > 1 makes minor stress less impactful, major stress more impactful
+  
+  # Calculate final yield with higher sensitivity to stress
+  final_yield <- base_yield * yield_impact
+  
+  return(list(
+    yield = final_yield,
+    daily_stress = daily_stress,
+    season_temps = season_temps,
+    stage_weights = stage_weights,
+    weighted_stress = weighted_stress
+  ))
+}
+
+# Weather Derivatives Functions
+#' Calculate farmer earnings without weather derivatives
+#'
+#' @param yield Wheat yield in tons per hectare
+#' @param price Price per ton
+#' @param cost Production cost per hectare
+#' @param farm_size Farm size in hectares
+#' @return Profit in dollars
+calculate_earnings_without_derivative <- function(yield, price, cost, farm_size) {
+  revenue <- yield * price * farm_size
+  total_cost <- cost * farm_size
+  profit <- revenue - total_cost
+  return(profit)
+}
+
+#' Calculate farmer earnings with weather derivatives
+#'
+#' @param yield Wheat yield in tons per hectare
+#' @param price Price per ton
+#' @param cost Production cost per hectare
+#' @param farm_size Farm size in hectares
+#' @param derivative_payout Payout from the weather derivative
+#' @param derivative_cost Cost of the weather derivative
+#' @return Profit in dollars
+calculate_earnings_with_derivative <- function(yield, price, cost, farm_size, 
+                                              derivative_payout, derivative_cost) {
+  # Calculate base earnings without derivative
+  base_profit <- calculate_earnings_without_derivative(yield, price, cost, farm_size)
+  
+  # Add derivative payout and subtract cost
+  profit_with_derivative <- base_profit + derivative_payout - derivative_cost
+  
+  return(profit_with_derivative)
+}
+
+#' Price an HDD-based weather derivative
+#' 
+#' @param sim_result Result from simulate_temperature function
+#' @param start_date Start date of the contract period
+#' @param end_date End date of the contract period
+#' @param strike Strike level for accumulated HDDs
+#' @param tick_size Payment per HDD ($/HDD)
+#' @param r Risk-free rate (annual)
+#' @param max_payout Maximum payout (NULL for uncapped)
+#' @return List with pricing results
+price_hdd_derivative <- function(sim_result, start_date, end_date, 
+                               strike, tick_size = 50, 
+                               r = 0.03, max_payout = NULL) {
+  
+  # Convert dates
+  start_date <- as.Date(start_date)
+  end_date <- as.Date(end_date)
+  
+  # Find indices for the contract period
+  start_idx <- which(sim_result$dates >= start_date)[1]
+  end_idx <- which(sim_result$dates <= end_date)[length(which(sim_result$dates <= end_date))]
+  
+  if (is.na(start_idx) || is.na(end_idx)) {
+    stop("Contract dates are outside the simulation period")
+  }
+  
+  # Calculate accumulated HDDs for each path
+  accumulated_hdds <- calculate_accumulated_hdd(
+    sim_result$temperatures, 
+    start_idx, 
+    end_idx, 
+    base = HDD_STRIKE
+  )
+  
+  # Calculate payoffs based on accumulated HDDs
+  payoffs <- tick_size * accumulated_hdds
+  
+  # Apply cap if specified
+  if (!is.null(max_payout)) {
+    payoffs <- pmin(payoffs, max_payout)
+  }
+  
+  # Calculate time to maturity in years
+  time_to_maturity <- as.numeric(end_date - sim_result$dates[1]) / 365
+  
+  # Apply discount factor
+  price <- exp(-r * time_to_maturity) * mean(payoffs)
+  
+  # Create pricing results
+  results <- list(
+    price = price,
+    payoffs = payoffs,
+    mean_payoff = mean(payoffs),
+    std_error = sd(payoffs) / sqrt(length(payoffs)),
+    accumulated_hdds = accumulated_hdds,
+    mean_accumulated_hdds = mean(accumulated_hdds),
+    contract = list(
+      type = "HDD Contract",
+      start_date = start_date,
+      end_date = end_date,
+      strike = strike,
+      tick_size = tick_size,
+      max_payout = max_payout
+    )
+  )
+  
+  return(results)
+}
+
+#' Price a CDD-based weather derivative
+#' 
+#' @param sim_result Result from simulate_temperature function
+#' @param start_date Start date of the contract period
+#' @param end_date End date of the contract period
+#' @param strike Strike level for accumulated CDDs
+#' @param tick_size Payment per CDD ($/CDD)
+#' @param r Risk-free rate (annual)
+#' @param max_payout Maximum payout (NULL for uncapped)
+#' @return List with pricing results
+price_cdd_derivative <- function(sim_result, start_date, end_date, 
+                               strike, tick_size = 75, 
+                               r = 0.03, max_payout = NULL) {
+  
+  # Convert dates
+  start_date <- as.Date(start_date)
+  end_date <- as.Date(end_date)
+  
+  # Find indices for the contract period
+  start_idx <- which(sim_result$dates >= start_date)[1]
+  end_idx <- which(sim_result$dates <= end_date)[length(which(sim_result$dates <= end_date))]
+  
+  if (is.na(start_idx) || is.na(end_idx)) {
+    stop("Contract dates are outside the simulation period")
+  }
+  
+  # Calculate accumulated CDDs for each path
+  accumulated_cdds <- calculate_accumulated_cdd(
+    sim_result$temperatures, 
+    start_idx, 
+    end_idx, 
+    base = CDD_STRIKE
+  )
+  
+  # Calculate payoffs based on accumulated CDDs
+  payoffs <- tick_size * accumulated_cdds
+  
+  # Apply cap if specified
+  if (!is.null(max_payout)) {
+    payoffs <- pmin(payoffs, max_payout)
+  }
+  
+  # Calculate time to maturity in years
+  time_to_maturity <- as.numeric(end_date - sim_result$dates[1]) / 365
+  
+  # Apply discount factor
+  price <- exp(-r * time_to_maturity) * mean(payoffs)
+  
+  # Create pricing results
+  results <- list(
+    price = price,
+    payoffs = payoffs,
+    mean_payoff = mean(payoffs),
+    std_error = sd(payoffs) / sqrt(length(payoffs)),
+    accumulated_cdds = accumulated_cdds,
+    mean_accumulated_cdds = mean(accumulated_cdds),
+    contract = list(
+      type = "CDD Contract",
+      start_date = start_date,
+      end_date = end_date,
+      strike = strike,
+      tick_size = tick_size,
+      max_payout = max_payout
+    )
+  )
+  
+  return(results)
+}
+```
+
+```{r execution}
+# ========== MODEL EXECUTION ==========
+# Load data and estimate parameters from historical temperatures
+cat("\nEstimating Alaton model parameters from historical data...\n")
+params <- estimate_alaton_parameters(TEMP_DATA_FILE)
+
+# Print a summary of the estimated parameters
+cat("\n========== MODEL PARAMETERS ==========\n")
+cat("A (base level):", round(params$A, 4), "°C\n")
+cat("B (trend):", round(params$B, 8), "°C/day\n")
+cat("C (amplitude):", round(params$C, 4), "°C\n")
+cat("phi (phase):", round(params$phi, 4), "radians\n")
+cat("a (mean reversion):", round(params$a, 4), "1/day\n")
+cat("Monthly volatilities (sigma):\n")
+month_names <- month.abb  # Jan, Feb, Mar, etc.
+for (i in 1:12) {
+  cat("  ", month_names[i], ": ", round(params$sigma_monthly[i], 4), "°C\n", sep="")
+}
+cat("=======================================\n")
+
+# Run temperature simulation
+cat("\nRunning temperature simulation with", N_SIMULATION_PATHS, "paths...\n")
+sim_result <- simulate_temperature(
+  start_date = SIM_START_DATE,
+  end_date = SIM_END_DATE,
+  initial_temp = INITIAL_TEMP,
+  A = params$A,
+  B = params$B,
+  C = params$C,
+  phi = params$phi,
+  a = params$a,
+  sigma_monthly = params$sigma_monthly,
+  lambda = 0,  # No risk premium for simulation
+  n_paths = N_SIMULATION_PATHS
+)
+
+# Extract simulated temperature data
+temps_matrix <- sim_result$temperatures
+dates <- sim_result$dates
+n_paths <- ncol(temps_matrix)
+
+cat("Temperature simulation complete.\n")
+
+# ========== WHEAT YIELD CALCULATION ==========
+cat("\nCalculating wheat yield under temperature scenarios...\n")
+
+# Create data structure to store results
+wheat_yields <- numeric(n_paths)
+wheat_results <- list()
+
+# Adjust planting day to correspond to simulation start date
+adjusted_planting_day <- PLANTING_DAY - yday(min(dates)) + 1
+if (adjusted_planting_day < 1) {
+  adjusted_planting_day <- adjusted_planting_day + 365  # Handle year boundary
+}
+
+# Check alignment of critical growth stages with simulation
+growing_season_length <- get_growing_season_length(WHEAT_STAGES)
+anthesis_start_day <- adjusted_planting_day + sum(sapply(WHEAT_STAGES[1:3], function(x) x$days))
+anthesis_end_day <- anthesis_start_day + WHEAT_STAGES$anthesis$days
+
+cat("\n========== WHEAT GROWTH STAGE TIMING ==========\n")
+cat("Simulation date range:", format(min(dates), "%b %d"), "to", format(max(dates), "%b %d"), "\n")
+cat("Planting day (adjusted):", adjusted_planting_day, "corresponds to", format(min(dates) + adjusted_planting_day - 1, "%b %d"), "\n")
+cat("Growing season: from day", adjusted_planting_day, "to day", adjusted_planting_day + growing_season_length - 1, "\n")
+cat("Critical anthesis stage: days", anthesis_start_day, "to", anthesis_end_day, "\n")
+cat("Anthesis dates:", format(min(dates) + anthesis_start_day - 1, "%b %d"), "to", format(min(dates) + anthesis_end_day - 1, "%b %d"), "\n")
+cat("=================================================\n\n")
+
+# Run wheat yield simulation for each temperature path
+for (path in 1:n_paths) {
+  # Get temperatures for this path
+  path_temps <- temps_matrix[, path]
+  
+  # Simulate wheat yield for this temperature path
+  result <- simulate_annual_wheat_yield(
+    temps = path_temps,
+    planting_day = adjusted_planting_day,
+    stages = WHEAT_STAGES,
+    base_yield = WHEAT_BASE_YIELD
+  )
+  
+  # Store results
+  wheat_yields[path] <- result$yield
+  wheat_results[[path]] <- result
+}
+
+# Calculate correlations between temperatures and yields
+avg_temps <- numeric(n_paths)
+anthesis_temps <- numeric(n_paths)
+max_temps <- numeric(n_paths)
+
+for (path in 1:n_paths) {
+  # Get growing season temperatures for this path
+  growing_days <- adjusted_planting_day:(adjusted_planting_day + growing_season_length - 1)
+  if (max(growing_days) <= nrow(temps_matrix)) {
+    avg_temps[path] <- mean(temps_matrix[growing_days, path])
+    
+    # Get temperatures during anthesis (critical stage)
+    anthesis_days <- anthesis_start_day:anthesis_end_day
+    anthesis_temps[path] <- mean(temps_matrix[anthesis_days, path])
+    
+    # Get maximum temperature during growing season
+    max_temps[path] <- max(temps_matrix[growing_days, path])
+  } else {
+    # Handle edge case
+    available_days <- growing_days[growing_days <= nrow(temps_matrix)]
+    avg_temps[path] <- mean(temps_matrix[available_days, path])
+    
+    # Anthesis days that are available
+    anthesis_days <- anthesis_start_day:anthesis_end_day
+    available_anthesis <- anthesis_days[anthesis_days <= nrow(temps_matrix)]
+    if (length(available_anthesis) > 0) {
+      anthesis_temps[path] <- mean(temps_matrix[available_anthesis, path])
+    }
+    
+    max_temps[path] <- max(temps_matrix[available_days, path])
+  }
+}
+
+# Calculate correlations
+avg_temp_yield_cor <- cor(avg_temps, wheat_yields)
+anthesis_temp_yield_cor <- cor(anthesis_temps, wheat_yields)
+max_temp_yield_cor <- cor(max_temps, wheat_yields)
+
+# Calculate yield losses relative to potential
+yield_losses <- WHEAT_BASE_YIELD - wheat_yields
+
+# Calculate yield summary statistics
+mean_yield <- mean(wheat_yields)
+median_yield <- median(wheat_yields)
+sd_yield <- sd(wheat_yields)
+min_yield <- min(wheat_yields)
+max_yield <- max(wheat_yields)
+
+# Display wheat yield results
+cat("\n========== WHEAT YIELD SIMULATION RESULTS ==========\n")
+cat("Base potential yield:", WHEAT_BASE_YIELD, "tons/ha\n")
+cat("Mean simulated yield:", round(mean_yield, 2), "tons/ha\n")
+cat("Median simulated yield:", round(median_yield, 2), "tons/ha\n")
+cat("Standard deviation:", round(sd_yield, 2), "tons/ha\n")
+cat("Yield range:", round(min_yield, 2), "to", round(max_yield, 2), "tons/ha\n")
+cat("Yield reduction from potential:", round((1 - mean_yield/WHEAT_BASE_YIELD) * 100, 1), "%\n\n")
+
+cat("TEMPERATURE-YIELD CORRELATIONS:\n")
+cat("Correlation with average growing season temperature:", round(avg_temp_yield_cor, 3), "\n")
+cat("Correlation with anthesis period temperature:", round(anthesis_temp_yield_cor, 3), "\n")
+cat("Correlation with maximum temperature:", round(max_temp_yield_cor, 3), "\n")
+cat("==================================================\n")
+
+# ========== WEATHER DERIVATIVES PRICING ==========
+cat("\nPricing weather derivatives...\n")
+
+# Price the HDD derivative for cold protection during early growth
+hdd_derivative <- price_hdd_derivative(
+  sim_result = sim_result,
+  start_date = HDD_CONTRACT_START,
+  end_date = HDD_CONTRACT_END,
+  strike = HDD_STRIKE,
+  tick_size = HDD_TICK_SIZE,
+  r = RISK_FREE_RATE,
+  max_payout = HDD_MAX_PAYOUT
+)
+
+# Price the CDD derivative for heat protection during anthesis/grain filling
+cdd_derivative <- price_cdd_derivative(
+  sim_result = sim_result,
+  start_date = CDD_CONTRACT_START,
+  end_date = CDD_CONTRACT_END,
+  strike = CDD_STRIKE,
+  tick_size = CDD_TICK_SIZE,
+  r = RISK_FREE_RATE,
+  max_payout = CDD_MAX_PAYOUT
+)
+
+# Calculate the total cost of the derivatives
+hdd_cost <- hdd_derivative$price
+cdd_cost <- cdd_derivative$price
+total_derivative_cost <- hdd_cost + cdd_cost
+
+# Get derivative payouts
+hdd_payouts <- hdd_derivative$payoffs
+cdd_payouts <- cdd_derivative$payoffs
+combined_payouts <- hdd_payouts + cdd_payouts
+
+# Calculate correlation between derivative payouts and yield losses
+cor_hdd <- cor(hdd_payouts, yield_losses)
+cor_cdd <- cor(cdd_payouts, yield_losses)
+cor_combined <- cor(combined_payouts, yield_losses)
+
+# Display derivative details with correlation info
+cat("\n========== WEATHER DERIVATIVE DETAILS ==========\n")
+cat("HDD CONTRACT (COLD PROTECTION):\n")
+cat("Contract period:", format(HDD_CONTRACT_START, "%b %d"), "to", format(HDD_CONTRACT_END, "%b %d"), "\n")
+cat("Contract type: Payments based on accumulated Heating Degree Days\n")
+cat("HDD Strike temperature:", HDD_STRIKE, "°C\n")
+cat("Tick size:", HDD_TICK_SIZE, "$ per HDD\n")
+cat("Maximum payout:", HDD_MAX_PAYOUT, "$\n")
+cat("Fair price:", round(hdd_cost, 2), "$\n")
+cat("Mean accumulated HDDs:", round(hdd_derivative$mean_accumulated_hdds, 2), "\n")
+cat("Correlation with yield loss:", round(cor_hdd, 3), "\n\n")
+
+cat("CDD CONTRACT (HEAT PROTECTION):\n")
+cat("Contract period:", format(CDD_CONTRACT_START, "%b %d"), "to", format(CDD_CONTRACT_END, "%b %d"), "\n")
+cat("Contract type: Payments based on accumulated Cooling Degree Days\n")
+cat("CDD Strike temperature:", CDD_STRIKE, "°C\n")
+cat("Tick size:", CDD_TICK_SIZE, "$ per CDD\n")
+cat("Maximum payout:", CDD_MAX_PAYOUT, "$\n")
+cat("Fair price:", round(cdd_cost, 2), "$\n")
+cat("Mean accumulated CDDs:", round(cdd_derivative$mean_accumulated_cdds, 2), "\n")
+cat("Correlation with yield loss:", round(cor_cdd, 3), "\n\n")
+
+cat("TOTAL DERIVATIVE PORTFOLIO:\n")
+cat("Total premium cost:", round(total_derivative_cost, 2), "$ (from pricing model)\n")
+cat("Hedge ratio applied:", HEDGE_RATIO * 100, "%\n")
+cat("Effective premium cost to farmer:", round(total_derivative_cost * HEDGE_RATIO, 2), "$\n")
+cat("Combined correlation with yield loss:", round(cor_combined, 3), "\n")
+cat("=================================================\n")
+
+# ========== EARNINGS CALCULATION ==========
+cat("\nCalculating farmer earnings scenarios...\n")
+
+# Calculate earnings for each simulation path
+earnings_without_derivative <- numeric(n_paths)
+earnings_with_derivative <- numeric(n_paths)
+
+for (path in 1:n_paths) {
+  # Get the wheat yield for this path
+  yield <- wheat_yields[path]
+  
+  # Calculate earnings without derivative
+  earnings_without_derivative[path] <- calculate_earnings_without_derivative(
+    yield = yield,
+    price = WHEAT_PRICE_PER_TON,
+    cost = PRODUCTION_COST_PER_HECTARE,
+    farm_size = FARM_SIZE_HECTARES
+  )
+  
+  # Calculate earnings with derivative
+  earnings_with_derivative[path] <- calculate_earnings_with_derivative(
+    yield = yield,
+    price = WHEAT_PRICE_PER_TON,
+    cost = PRODUCTION_COST_PER_HECTARE,
+    farm_size = FARM_SIZE_HECTARES,
+    derivative_payout = combined_payouts[path] * HEDGE_RATIO,
+    derivative_cost = total_derivative_cost * HEDGE_RATIO
+  )
+}
+
+# Calculate earnings summary statistics
+mean_earnings_without <- mean(earnings_without_derivative)
+mean_earnings_with <- mean(earnings_with_derivative)
+min_earnings_without <- min(earnings_without_derivative)
+min_earnings_with <- min(earnings_with_derivative)
+max_earnings_without <- max(earnings_without_derivative)
+max_earnings_with <- max(earnings_with_derivative)
+sd_earnings_without <- sd(earnings_without_derivative)
+sd_earnings_with <- sd(earnings_with_derivative)
+
+# Value at Risk (VaR) calculations at 95% confidence level
+var_95_without <- quantile(earnings_without_derivative, 0.05)
+var_95_with <- quantile(earnings_with_derivative, 0.05)
+
+# Display earnings summary
+cat("\n========== FARMER EARNINGS SUMMARY ==========\n")
+cat("Farm size:", FARM_SIZE_HECTARES, "hectares\n")
+cat("Wheat price:", WHEAT_PRICE_PER_TON, "$/ton\n")
+cat("Production cost:", PRODUCTION_COST_PER_HECTARE, "$/hectare\n\n")
+
+cat("WITHOUT WEATHER DERIVATIVE:\n")
+cat("Mean earnings:", round(mean_earnings_without), "$\n")
+cat("Min earnings:", round(min_earnings_without), "$\n") 
+cat("Max earnings:", round(max_earnings_without), "$\n")
+cat("Standard deviation:", round(sd_earnings_without), "$\n")
+cat("5% Value at Risk:", round(var_95_without), "$\n\n")
+
+cat("WITH WEATHER DERIVATIVES PORTFOLIO (", HEDGE_RATIO * 100, "% hedge):\n", sep="")
+cat("Mean earnings:", round(mean_earnings_with), "$\n")
+cat("Min earnings:", round(min_earnings_with), "$\n")
+cat("Max earnings:", round(max_earnings_with), "$\n") 
+cat("Standard deviation:", round(sd_earnings_with), "$\n")
+cat("5% Value at Risk:", round(var_95_with), "$\n\n")
+
+cat("IMPACT OF DERIVATIVE:\n")
+cat("Change in mean earnings:", round(mean_earnings_with - mean_earnings_without), "$\n")
+cat("Reduction in earnings volatility:", 
+    round((1 - sd_earnings_with/sd_earnings_without) * 100, 1), "%\n")
+cat("Improvement in worst-case scenario:", 
+    round((min_earnings_with - min_earnings_without)), "$\n")
+cat("VaR improvement:", round(var_95_with - var_95_without), "$\n")
+cat("==============================================\n")
+
+# Store key results in a combined list for later visualization
+model_results <- list(
+  simulation = sim_result,
+  wheat = list(
+    yields = wheat_yields,
+    results = wheat_results,
+    avg_temps = avg_temps,
+    anthesis_temps = anthesis_temps,
+    max_temps = max_temps,
+    yield_losses = yield_losses
+  ),
+  derivatives = list(
+    hdd = hdd_derivative,
+    cdd = cdd_derivative,
+    hdd_payouts = hdd_payouts,
+    cdd_payouts = cdd_payouts,
+    combined_payouts = combined_payouts
+  ),
+  earnings = list(
+    without_derivative = earnings_without_derivative,
+    with_derivative = earnings_with_derivative
+  )
+)
+
+cat("\nExecution complete. Results stored in 'model_results' object.\n")
+```
+
+```{r visualization}
+# ========== VISUALIZATION SECTION ==========
+# This section assumes 'model_results' object is available from the execution section
+
+# Create a directory to save plots if it doesn't exist
+plot_dir <- "plots"
+dir.create(plot_dir, showWarnings = FALSE)
+
+# Function to save plots with proper error handling
+save_plot <- function(plot, filename, width = 10, height = 6) {
+  full_path <- file.path(plot_dir, filename)
+  tryCatch({
+    ggsave(full_path, plot, width = width, height = height)
+    cat("Saved:", full_path, "\n")
+  }, error = function(e) {
+    cat("Error saving", full_path, ":", e$message, "\n")
+  })
+}
+
+# Extract results for easier reference
+sim_result <- model_results$simulation
+wheat_yields <- model_results$wheat$yields
+avg_temps <- model_results$wheat$avg_temps
+anthesis_temps <- model_results$wheat$anthesis_temps
+max_temps <- model_results$wheat$max_temps
+yield_losses <- model_results$wheat$yield_losses
+hdd_payouts <- model_results$derivatives$hdd_payouts
+cdd_payouts <- model_results$derivatives$cdd_payouts
+combined_payouts <- model_results$derivatives$combined_payouts
+earnings_without_derivative <- model_results$earnings$without_derivative
+earnings_with_derivative <- model_results$earnings$with_derivative
+
+# Create a list to store all plots
+plots <- list()
+
+cat("\nCreating visualizations...\n")
+
+# ========== TEMPERATURE VISUALIZATION ==========
+cat("1. Creating temperature visualizations...\n")
+
+# 1. Plot individual temperature paths
+plots$paths_plot <- plot_temperature_paths(
+  sim_result,
+  n_paths = N_PATHS_TO_PLOT,
+  plot_type = "all"
+)
+
+# 2. Plot temperature summary with confidence bands
+plots$summary_plot <- plot_temperature_paths(
+  sim_result,
+  plot_type = "summary"
+)
+
+# 3. Plot temperature distribution
+plots$distribution_plot <- plot_temperature_distribution(sim_result)
+
+# 4. Plot all temperature paths with unique colors
+# Extract simulation results
+dates_all <- sim_result$dates
+temps_all <- sim_result$temperatures
+mean_temps_all <- sim_result$mean_temps
+
+# Build long-format data frame
+df_all <- data.frame(Date = dates_all, temps_all)
+colnames(df_all)[-1] <- paste0("Path", seq_len(ncol(temps_all)))
+df_long <- melt(
+  df_all,
+  id.vars = "Date",
+  variable.name = "Path",
+  value.name = "Temperature"
+)
+
+# Seasonal mean as its own data frame
+df_mean <- data.frame(Date = dates_all, MeanTemp = mean_temps_all)
+
+# Number of paths and a matching rainbow palette
+n_paths <- ncol(temps_all)
+subset_paths <- min(N_PATHS_TO_PLOT * 5, n_paths)
+palette <- rainbow(subset_paths)
+
+# Create the plot for all paths
+plots$all_paths_plot <- ggplot(df_long[df_long$Path %in% paste0("Path", 1:subset_paths), ], 
+                             aes(x = Date, y = Temperature, group = Path, color = Path)) +
+  geom_line(alpha = 0.5) +
+  scale_color_manual(
+    values = setNames(palette, paste0("Path", seq_len(subset_paths)))
+  ) +
+  guides(color = FALSE) +  # hide legend
+  geom_line(
+    data = df_mean,
+    aes(x = Date, y = MeanTemp),
+    color = "black",
+    size = 1.2,
+    inherit.aes = FALSE
+  ) +
+  labs(
+    title = sprintf("Simulated Temperature Paths (showing %d of %d)", subset_paths, n_paths),
+    x = "Date",
+    y = "Temperature (°C)"
+  ) +
+  theme_minimal()
+
+# ========== DEGREE DAYS VISUALIZATION ==========
+cat("2. Creating degree days visualizations...\n")
+
+# 5. HDD and CDD calculations and visualizations
+# Use a smaller subset of simulation paths for clearer visualization
+subset_paths_dd <- 5
+dates <- sim_result$dates
+temp_subset <- sim_result$temperatures[, 1:subset_paths_dd]
+
+# Create data frames for degree day plotting
+degree_day_data <- data.frame()
+
+for (path in 1:subset_paths_dd) {
+  # Get temperatures for this path
+  temps <- temp_subset[, path]
+  
+  # Calculate HDDs and CDDs
+  hdds <- calculate_hdd(temps, base = HDD_STRIKE)
+  cdds <- calculate_cdd(temps, base = CDD_STRIKE)
+  
+  # Calculate cumulative sums
+  cum_hdds <- cumsum(hdds)
+  cum_cdds <- cumsum(cdds)
+  
+  # Create temp data frame
+  path_df <- data.frame(
+    Date = dates,
+    Path = factor(path),
+    HDD = hdds,
+    CDD = cdds,
+    CumHDD = cum_hdds,
+    CumCDD = cum_cdds
+  )
+  
+  # Combine data
+  degree_day_data <- rbind(degree_day_data, path_df)
+}
+
+# Create HDD/CDD plots
+plots$hdd_plot <- ggplot(degree_day_data, aes(x = Date, y = HDD, color = Path)) +
+  geom_line(alpha = 0.7) +
+  labs(title = "Heating Degree Days",
+       subtitle = paste("Based on", subset_paths_dd, "temperature paths (Base:", HDD_STRIKE, "°C)"),
+       x = "Date", y = "HDD") +
+  theme_minimal()
+
+plots$cdd_plot <- ggplot(degree_day_data, aes(x = Date, y = CDD, color = Path)) +
+  geom_line(alpha = 0.7) +
+  labs(title = "Cooling Degree Days",
+       subtitle = paste("Based on", subset_paths_dd, "temperature paths (Base:", CDD_STRIKE, "°C)"),
+       x = "Date", y = "CDD") +
+  theme_minimal()
+
+# 6. Create cumulative HDD/CDD plots
+plots$cum_hdd_plot <- ggplot(degree_day_data, aes(x = Date, y = CumHDD, color = Path)) +
+  geom_line(alpha = 0.7) +
+  labs(title = "Cumulative Heating Degree Days",
+       subtitle = paste("Based on", subset_paths_dd, "temperature paths (Base:", HDD_STRIKE, "°C)"),
+       x = "Date", y = "Cumulative HDD") +
+  theme_minimal()
+
+plots$cum_cdd_plot <- ggplot(degree_day_data, aes(x = Date, y = CumCDD, color = Path)) +
+  geom_line(alpha = 0.7) +
+  labs(title = "Cumulative Cooling Degree Days",
+       subtitle = paste("Based on", subset_paths_dd, "temperature paths (Base:", CDD_STRIKE, "°C)"),
+       x = "Date", y = "Cumulative CDD") +
+  theme_minimal()
+
+# 7. Create combined HDD/CDD visualization with base temperatures
+# Extract first path for demonstration
+path_index <- 1
+temps <- sim_result$temperatures[, path_index]
+
+combined_df <- data.frame(
+  Date = dates,
+  Temperature = temps,
+  HDD_Strike = rep(HDD_STRIKE, length(temps)),
+  CDD_Strike = rep(CDD_STRIKE, length(temps))
+)
+
+plots$combined_dd_plot <- ggplot(combined_df, aes(x = Date)) +
+  geom_line(aes(y = Temperature), color = "black") +
+  geom_line(aes(y = HDD_Strike), color = "blue", linetype = "dashed") +
+  geom_line(aes(y = CDD_Strike), color = "red", linetype = "dashed") +
+  geom_ribbon(aes(ymin = pmin(Temperature, HDD_STRIKE), ymax = HDD_STRIKE), 
+              fill = "blue", alpha = 0.3) +
+  geom_ribbon(aes(ymin = CDD_STRIKE, ymax = pmax(Temperature, CDD_STRIKE)), 
+              fill = "red", alpha = 0.3) +
+  labs(title = "Temperature with HDD and CDD Thresholds",
+       subtitle = paste("HDD Strike:", HDD_STRIKE, "°C, CDD Strike:", CDD_STRIKE, "°C"),
+       x = "Date", y = "Temperature (°C)") +
+  theme_minimal()
+
+# 8. Create HDD/CDD contract period visualization
+# Filter data to the contract periods
+hdd_contract_dates <- combined_df$Date >= HDD_CONTRACT_START & combined_df$Date <= HDD_CONTRACT_END
+cdd_contract_dates <- combined_df$Date >= CDD_CONTRACT_START & combined_df$Date <= CDD_CONTRACT_END
+
+contract_df <- combined_df
+
+plots$contract_periods_plot <- ggplot(contract_df, aes(x = Date)) +
+  geom_line(aes(y = Temperature), color = "black") +
+  geom_line(aes(y = HDD_Strike), color = "blue", linetype = "dashed") +
+  geom_line(aes(y = CDD_Strike), color = "red", linetype = "dashed") +
+  # HDD contract period highlight
+  geom_rect(aes(xmin = HDD_CONTRACT_START, xmax = HDD_CONTRACT_END, 
+                ymin = -Inf, ymax = Inf), 
+            fill = "blue", alpha = 0.1) +
+  # CDD contract period highlight  
+  geom_rect(aes(xmin = CDD_CONTRACT_START, xmax = CDD_CONTRACT_END, 
+                ymin = -Inf, ymax = Inf), 
+            fill = "red", alpha = 0.1) +
+  # HDD accumulation area
+  geom_ribbon(data = contract_df[hdd_contract_dates,], 
+              aes(ymin = pmin(Temperature, HDD_STRIKE), ymax = HDD_STRIKE), 
+              fill = "blue", alpha = 0.3) +
+  # CDD accumulation area
+  geom_ribbon(data = contract_df[cdd_contract_dates,], 
+              aes(ymin = CDD_STRIKE, ymax = pmax(Temperature, CDD_STRIKE)), 
+              fill = "red", alpha = 0.3) +
+  annotate("text", x = HDD_CONTRACT_START + (HDD_CONTRACT_END - HDD_CONTRACT_START)/2, 
+           y = min(contract_df$Temperature) + 2, 
+           label = "HDD Contract Period", color = "blue") +
+  annotate("text", x = CDD_CONTRACT_START + (CDD_CONTRACT_END - CDD_CONTRACT_START)/2, 
+           y = max(contract_df$Temperature) - 2, 
+           label = "CDD Contract Period", color = "red") +
+  labs(title = "Weather Derivative Contract Periods",
+       subtitle = "Showing HDD and CDD contract periods with accumulation areas",
+       x = "Date", y = "Temperature (°C)") +
+  theme_minimal()
+
+# ========== WHEAT YIELD VISUALIZATION ==========
+cat("3. Creating wheat yield visualizations...\n")
+
+# 9. Create a histogram of yields
+hist_data <- data.frame(Yield = wheat_yields)
+mean_yield <- mean(wheat_yields)
+plots$yield_hist <- ggplot(hist_data, aes(x = Yield)) +
+  geom_histogram(bins = 30, fill = "darkgreen", color = "black", alpha = 0.7) +
+  geom_vline(xintercept = mean_yield, color = "red", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = WHEAT_BASE_YIELD, color = "blue", linetype = "dotted", size = 1) +
+  annotate("text", x = mean_yield * 0.98, y = 0, 
+           label = paste("Mean:", round(mean_yield, 2)), 
+           hjust = 1, vjust = -0.5, color = "red") +
+  annotate("text", x = WHEAT_BASE_YIELD * 1.02, y = 0, 
+           label = paste("Potential:", WHEAT_BASE_YIELD), 
+           hjust = 0, vjust = -0.5, color = "blue") +
+  labs(title = "Distribution of Simulated Wheat Yields",
+       subtitle = paste(n_paths, "temperature scenarios"),
+       x = "Yield (tons/ha)", y = "Frequency") +
+  theme_minimal()
+
+# 10. Plot temperature vs yield relationships
+temp_yield_df <- data.frame(
+  AvgTemp = avg_temps,
+  AnthesisTemp = anthesis_temps,
+  MaxTemp = max_temps,
+  Yield = wheat_yields
+)
+
+# Average temperature vs yield
+avg_temp_yield_cor <- cor(avg_temps, wheat_yields)
+plots$avg_temp_yield_plot <- ggplot(temp_yield_df, aes(x = AvgTemp, y = Yield)) +
+  geom_point(alpha = 0.5, color = "darkgreen") +
+  geom_smooth(method = "loess", color = "red") +
+  annotate("text", x = min(temp_yield_df$AvgTemp) + 0.5, y = min(temp_yield_df$Yield) + 0.2,
+           label = paste("Correlation:", round(avg_temp_yield_cor, 3)),
+           hjust = 0, vjust = 0, color = "darkblue") +
+  labs(
+    title = "Relationship Between Average Temperature and Wheat Yield",
+    x = "Average Growing Season Temperature (°C)",
+    y = "Wheat Yield (tons/ha)"
+  ) +
+  theme_minimal()
+
+# Anthesis temperature vs yield
+anthesis_temp_yield_cor <- cor(anthesis_temps, wheat_yields)
+plots$anthesis_temp_yield_plot <- ggplot(temp_yield_df, aes(x = AnthesisTemp, y = Yield)) +
+  geom_point(alpha = 0.5, color = "purple") +
+  geom_smooth(method = "loess", color = "red") +
+  annotate("text", x = min(temp_yield_df$AnthesisTemp) + 0.5, y = min(temp_yield_df$Yield) + 0.2,
+           label = paste("Correlation:", round(anthesis_temp_yield_cor, 3)),
+           hjust = 0, vjust = 0, color = "darkblue") +
+  labs(
+    title = "Relationship Between Anthesis Temperature and Wheat Yield",
+    x = "Average Anthesis Period Temperature (°C)",
+    y = "Wheat Yield (tons/ha)"
+  ) +
+  theme_minimal()
+
+# Max temperature vs yield
+max_temp_yield_cor <- cor(max_temps, wheat_yields)
+plots$max_temp_yield_plot <- ggplot(temp_yield_df, aes(x = MaxTemp, y = Yield)) +
+  geom_point(alpha = 0.5, color = "tomato") +
+  geom_smooth(method = "loess", color = "red") +
+  annotate("text", x = min(temp_yield_df$MaxTemp) + 0.5, y = min(temp_yield_df$Yield) + 0.2,
+           label = paste("Correlation:", round(max_temp_yield_cor, 3)),
+           hjust = 0, vjust = 0, color = "darkblue") +
+  labs(
+    title = "Relationship Between Maximum Temperature and Wheat Yield",
+    x = "Maximum Growing Season Temperature (°C)",
+    y = "Wheat Yield (tons/ha)"
+  ) +
+  theme_minimal()
+
+# ========== WEATHER DERIVATIVES & EARNINGS VISUALIZATION ==========
+cat("4. Creating derivatives and earnings visualizations...\n")
+
+# 11. Create a histogram of earnings
+earnings_df <- data.frame(
+  Scenario = rep(c("Without Derivatives", "With Derivatives"), each = n_paths),
+  Earnings = c(earnings_without_derivative, earnings_with_derivative)
+)
+
+mean_earnings_without <- mean(earnings_without_derivative)
+mean_earnings_with <- mean(earnings_with_derivative)
+var_95_without <- quantile(earnings_without_derivative, 0.05)
+var_95_with <- quantile(earnings_with_derivative, 0.05)
+
+plots$earnings_hist <- ggplot(earnings_df, aes(x = Earnings, fill = Scenario)) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  geom_vline(xintercept = mean_earnings_without, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = mean_earnings_with, color = "blue", linetype = "dashed") +
+  geom_vline(xintercept = var_95_without, color = "red", linetype = "dotted") +
+  geom_vline(xintercept = var_95_with, color = "blue", linetype = "dotted") +
+  scale_fill_manual(values = c("Without Derivatives" = "tomato", "With Derivatives" = "steelblue")) +
+  labs(title = "Distribution of Farmer Earnings",
+       subtitle = paste("With and without weather derivatives portfolio (", HEDGE_RATIO * 100, "% hedge)", sep=""),
+       x = "Earnings ($)", y = "Frequency") +
+  theme_minimal()
+
+# 12. Create a scatterplot showing the relationship between yield and earnings
+earnings_yield_df <- data.frame(
+  Yield = rep(wheat_yields, 2),
+  Earnings = c(earnings_without_derivative, earnings_with_derivative),
+  Scenario = rep(c("Without Derivatives", "With Derivatives"), each = n_paths)
+)
+
+plots$earnings_yield_plot <- ggplot(earnings_yield_df, aes(x = Yield, y = Earnings, color = Scenario)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm") +
+  scale_color_manual(values = c("Without Derivatives" = "tomato", "With Derivatives" = "steelblue")) +
+  labs(title = "Relationship Between Wheat Yield and Farmer Earnings",
+       x = "Wheat Yield (tons/ha)", y = "Earnings ($)") +
+  theme_minimal()
+
+# 13. Create a plot showing how the derivative payout responds to yield loss
+derivative_yield_df <- data.frame(
+  Yield = wheat_yields,
+  YieldLoss = yield_losses,
+  HDDPayout = hdd_payouts * HEDGE_RATIO,
+  CDDPayout = cdd_payouts * HEDGE_RATIO,
+  TotalPayout = combined_payouts * HEDGE_RATIO
+)
+
+# 14. Create separate payout plots for HDD and CDD contracts
+plots$hdd_payout_plot <- ggplot(derivative_yield_df, aes(x = YieldLoss, y = HDDPayout)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_smooth(method = "loess", color = "darkblue") +
+  labs(title = "HDD Contract Payout vs Yield Loss",
+       subtitle = paste("Hedge ratio:", HEDGE_RATIO),
+       x = "Yield Loss (tons/ha)", y = "HDD Contract Payout ($)") +
+  theme_minimal()
+
+plots$cdd_payout_plot <- ggplot(derivative_yield_df, aes(x = YieldLoss, y = CDDPayout)) +
+  geom_point(alpha = 0.6, color = "red") +
+  geom_smooth(method = "loess", color = "darkred") +
+  labs(title = "CDD Contract Payout vs Yield Loss",
+       subtitle = paste("Hedge ratio:", HEDGE_RATIO),
+       x = "Yield Loss (tons/ha)", y = "CDD Contract Payout ($)") +
+  theme_minimal()
+
+# 15. Combined derivative payout plot
+plots$payout_plot <- ggplot(derivative_yield_df, aes(x = YieldLoss, y = TotalPayout)) +
+  geom_point(alpha = 0.6, color = "darkgreen") +
+  geom_smooth(method = "loess", color = "purple") +
+  labs(title = "Weather Derivative Portfolio Payout vs Yield Loss",
+       subtitle = paste("Hedge ratio:", HEDGE_RATIO),
+       x = "Yield Loss (tons/ha)", y = "Derivative Payout ($)") +
+  theme_minimal()
+
+# 16. Create boxplots comparing earnings distributions
+plots$earnings_boxplot <- ggplot(earnings_df, aes(x = Scenario, y = Earnings, fill = Scenario)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("Without Derivatives" = "tomato", "With Derivatives" = "steelblue")) +
+  labs(title = "Comparison of Earnings Distributions",
+       subtitle = paste("With and without weather derivatives portfolio (", HEDGE_RATIO * 100, "% hedge)", sep=""),
+       y = "Earnings ($)") +
+  theme_minimal() +
+  guides(fill = FALSE)  # Hide the legend
+
+# 17. Create a correlation plot to visualize hedging effectiveness
+corr_data <- data.frame(
+  YieldLoss = yield_losses,
+  HDDPayout = hdd_payouts * HEDGE_RATIO,
+  CDDPayout = cdd_payouts * HEDGE_RATIO,
+  TotalPayout = combined_payouts * HEDGE_RATIO
+)
+
+# Calculate correlation for display
+cor_hdd <- cor(corr_data$YieldLoss, corr_data$HDDPayout)
+cor_cdd <- cor(corr_data$YieldLoss, corr_data$CDDPayout)
+cor_combined <- cor(corr_data$YieldLoss, corr_data$TotalPayout)
+
+plots$hedge_effectiveness_plot <- ggplot(corr_data, aes(x = YieldLoss, y = TotalPayout)) +
+  geom_point(alpha = 0.6, color = "darkgreen") +
+  geom_smooth(method = "lm", color = "blue") +
+  annotate("text", x = min(corr_data$YieldLoss) + 0.1, y = max(corr_data$TotalPayout) * 0.9,
+           label = paste("Correlation:", round(cor_combined, 3)), 
+           hjust = 0, vjust = 1, color = "darkblue") +
+  labs(title = "Hedging Effectiveness: Derivative Payouts vs Yield Losses",
+       subtitle = paste("Hedge ratio:", HEDGE_RATIO),
+       x = "Yield Loss (tons/ha)", y = "Derivative Payout ($)") +
+  theme_minimal()
+
+# 18. Create accumulated HDD/CDD histogram
+# Get the accumulated HDDs and CDDs from the derivative pricing
+hdd_accum <- model_results$derivatives$hdd$accumulated_hdds
+cdd_accum <- model_results$derivatives$cdd$accumulated_cdds
+
+hdd_accum_df <- data.frame(Value = hdd_accum, Type = "HDD")
+cdd_accum_df <- data.frame(Value = cdd_accum, Type = "CDD")
+accum_df <- rbind(hdd_accum_df, cdd_accum_df)
+
+plots$accum_hist <- ggplot(accum_df, aes(x = Value, fill = Type)) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  scale_fill_manual(values = c("HDD" = "blue", "CDD" = "red")) +
+  labs(title = "Distribution of Accumulated HDDs and CDDs",
+       subtitle = paste("For HDD contract period (", format(HDD_CONTRACT_START, "%b %d"), "to", 
+                       format(HDD_CONTRACT_END, "%b %d"), ") and CDD contract period (", 
+                       format(CDD_CONTRACT_START, "%b %d"), "to", format(CDD_CONTRACT_END, "%b %d"), ")"),
+       x = "Accumulated Degree Days", y = "Frequency") +
+  theme_minimal()
+
+# ========== REDUCE TITLE SIZE FOR ALL PLOTS ==========
+cat("5. Adjusting plot title sizes and displaying individual plots...\n")
+
+# Function to adjust title sizes for any ggplot object
+reduce_title_size <- function(plot) {
+  plot + 
+    theme(
+      plot.title = element_text(size = 10),
+      plot.subtitle = element_text(size = 8),
+      axis.title = element_text(size = 9),
+      legend.title = element_text(size = 8),
+      legend.text = element_text(size = 7)
+    )
+}
+
+# Apply reduced title size to all plots
+for (name in names(plots)) {
+  plots[[name]] <- reduce_title_size(plots[[name]])
+  
+  # Display each plot individually
+  cat("Displaying plot:", name, "\n")
+  print(plots[[name]])
+}
+
+# ========== PLOT GRID ARRANGEMENTS ==========
+cat("6. Creating multi-plot arrangements...\n")
+
+# Create a grid arrangement of key temperature plots
+temp_grid <- grid.arrange(
+  plots$paths_plot, 
+  plots$summary_plot, 
+  plots$distribution_plot, 
+  plots$combined_dd_plot,
+  ncol = 2, nrow = 2
+)
+
+# Create a grid arrangement of degree days plots
+degree_days_grid <- grid.arrange(
+  plots$hdd_plot,
+  plots$cdd_plot,
+  plots$cum_hdd_plot,
+  plots$cum_cdd_plot,
+  ncol = 2, nrow = 2
+)
+
+# Create a grid arrangement of contract period visualizations
+contract_grid <- grid.arrange(
+  plots$contract_periods_plot,
+  plots$accum_hist,
+  plots$hdd_payout_plot,
+  plots$cdd_payout_plot,
+  ncol = 2, nrow = 2
+)
+
+# Create a grid arrangement of yield-temperature relationship plots
+yield_temp_grid <- grid.arrange(
+  plots$yield_hist,
+  plots$avg_temp_yield_plot,
+  plots$anthesis_temp_yield_plot,
+  plots$max_temp_yield_plot,
+  ncol = 2, nrow = 2
+)
+
+# Create a grid arrangement of earnings and derivative plots
+earnings_grid <- grid.arrange(
+  plots$earnings_hist,
+  plots$earnings_boxplot,
+  plots$earnings_yield_plot,
+  plots$hedge_effectiveness_plot,
+  ncol = 2, nrow = 2
+)
+
+# Display the grid arrangements
+print(temp_grid)
+print(degree_days_grid)
+print(contract_grid)
+print(yield_temp_grid)
+print(earnings_grid)
+
+# ========== SAVE ALL PLOTS ==========
+cat("7. Saving plots to files...\n")
+
+# Save individual plots
+save_plot(plots$paths_plot, "temperature_paths.png")
+save_plot(plots$summary_plot, "temperature_summary.png")
+save_plot(plots$distribution_plot, "temperature_distribution.png")
+save_plot(plots$all_paths_plot, "temperature_all_paths.png")
+save_plot(plots$hdd_plot, "hdd_plot.png")
+save_plot(plots$cdd_plot, "cdd_plot.png")
+save_plot(plots$cum_hdd_plot, "cumulative_hdd_plot.png")
+save_plot(plots$cum_cdd_plot, "cumulative_cdd_plot.png")
+save_plot(plots$combined_dd_plot, "combined_dd_plot.png")
+save_plot(plots$contract_periods_plot, "contract_periods_plot.png")
+save_plot(plots$yield_hist, "wheat_yield_histogram.png")
+save_plot(plots$avg_temp_yield_plot, "avg_temp_yield_relationship.png")
+save_plot(plots$anthesis_temp_yield_plot, "anthesis_temp_yield_relationship.png")
+save_plot(plots$max_temp_yield_plot, "max_temp_yield_relationship.png")
+save_plot(plots$earnings_hist, "farmer_earnings_histogram.png")
+save_plot(plots$earnings_yield_plot, "earnings_yield_relationship.png")
+save_plot(plots$payout_plot, "derivative_payout_vs_loss.png")
+save_plot(plots$hdd_payout_plot, "hdd_payout_plot.png")
+save_plot(plots$cdd_payout_plot, "cdd_payout_plot.png")
+save_plot(plots$earnings_boxplot, "earnings_boxplot.png")
+save_plot(plots$hedge_effectiveness_plot, "hedge_effectiveness_plot.png")
+save_plot(plots$accum_hist, "accumulated_degree_days_histogram.png")
+
+# Save grid arrangements
+save_plot(temp_grid, "temperature_grid.png", width = 12, height = 10)
+save_plot(degree_days_grid, "degree_days_grid.png", width = 12, height = 10)
+save_plot(contract_grid, "contract_grid.png", width = 12, height = 10)
+save_plot(yield_temp_grid, "yield_temperature_grid.png", width = 12, height = 10)
+save_plot(earnings_grid, "earnings_grid.png", width = 12, height = 10)
+
+cat("\nVisualization complete! All plots saved to '", plot_dir, "' directory.\n", sep="")
+
+# Return a list of all plots and grids
+visualization_results <- list(
+  plots = plots,
+  grids = list(
+    temp_grid = temp_grid,
+    degree_days_grid = degree_days_grid,
+    contract_grid = contract_grid,
+    yield_temp_grid = yield_temp_grid,
+    earnings_grid = earnings_grid
+  )
+)
+```
+
+```{r Analytics}
+# ========== COMPREHENSIVE ANALYTICS FOR CHAPTER 4 ==========
+cat("\nGenerating comprehensive analytics for thesis Chapter 4...\n")
+
+# Create analytics directory for outputs
+analytics_dir <- "analytics"
+dir.create(analytics_dir, showWarnings = FALSE)
+
+# Function to save analytics tables
+save_table <- function(data, filename) {
+  full_path <- file.path(analytics_dir, paste0(filename, ".csv"))
+  tryCatch({
+    write.csv(data, full_path, row.names = FALSE)
+    cat("Saved:", full_path, "\n")
+  }, error = function(e) {
+    cat("Error saving", full_path, ":", e$message, "\n")
+  })
+}
+
+# ========== 1. TEMPERATURE SIMULATION ANALYSIS ==========
+cat("\n1. Analyzing temperature simulation results...\n")
+
+# 1.1 Annual temperature statistics
+yearly_temps <- as.vector(sim_result$temperatures)
+yearly_temp_stats <- data.frame(
+  Metric = c(
+    "Mean Temperature (°C)",
+    "Median Temperature (°C)",
+    "Minimum Temperature (°C)",
+    "Maximum Temperature (°C)",
+    "Standard Deviation (°C)",
+    "5th Percentile (°C)",
+    "95th Percentile (°C)",
+    "Days Below HDD Strike",
+    "Days Above CDD Strike"
+  ),
+  Value = c(
+    mean(yearly_temps),
+    median(yearly_temps),
+    min(yearly_temps),
+    max(yearly_temps),
+    sd(yearly_temps),
+    quantile(yearly_temps, 0.05),
+    quantile(yearly_temps, 0.95),
+    mean(apply(sim_result$temperatures, 2, function(x) sum(x < HDD_STRIKE))),
+    mean(apply(sim_result$temperatures, 2, function(x) sum(x > CDD_STRIKE)))
+  )
+)
+
+# 1.2 Monthly temperature analysis
+monthly_stats <- data.frame()
+
+for (m in 1:12) {
+  # Get indices for this month
+  month_indices <- which(month(sim_result$dates) == m)
+  
+  if (length(month_indices) > 0) {
+    # Extract temperatures for this month across all paths
+    month_temps <- sim_result$temperatures[month_indices, , drop = FALSE]
+    flat_temps <- as.vector(month_temps) # Flatten to vector
+    
+    # Calculate statistics
+    monthly_stats <- rbind(monthly_stats, data.frame(
+      Month = month.abb[m],
+      MonthNum = m,
+      MeanTemp = mean(flat_temps),
+      MedianTemp = median(flat_temps),
+      MinTemp = min(flat_temps),
+      MaxTemp = max(flat_temps),
+      StdDev = sd(flat_temps),
+      Q05 = quantile(flat_temps, 0.05),
+      Q95 = quantile(flat_temps, 0.95),
+      DaysBelow = ifelse(length(month_indices) > 0, 
+                        mean(apply(month_temps, 2, function(x) sum(x < HDD_STRIKE))), 
+                        NA),
+      DaysAbove = ifelse(length(month_indices) > 0, 
+                       mean(apply(month_temps, 2, function(x) sum(x > CDD_STRIKE))), 
+                       NA)
+    ))
+  }
+}
+
+# 1.3 Monthly temperature comparison with model parameters
+monthly_expected_temps <- data.frame(
+  Month = month.abb,
+  MonthNum = 1:12,
+  ExpectedMean = NA,
+  SimulatedMean = monthly_stats$MeanTemp,
+  Difference = NA
+)
+
+# Calculate expected temperature for each month based on model parameters
+omega <- 2 * pi / 365
+for (m in 1:12) {
+  # Get middle day of month
+  middle_day <- as.Date(paste0("2026-", sprintf("%02d", m), "-15"))
+  day_of_year_num <- as.numeric(format(middle_day, "%j"))
+  days_since_1970 <- as.numeric(middle_day - as.Date("1970-01-01"))
+  
+  # Calculate expected temperature from model
+  expected_temp <- params$A + params$B * days_since_1970 - 
+                  params$C * sin(omega * day_of_year_num + params$phi)
+  monthly_expected_temps$ExpectedMean[m] <- expected_temp
+  monthly_expected_temps$Difference[m] <- monthly_stats$MeanTemp[m] - expected_temp
+}
+
+# 1.4 Contract Period Temperature Analysis
+# HDD contract period analysis
+hdd_indices <- which(sim_result$dates >= HDD_CONTRACT_START & 
+                    sim_result$dates <= HDD_CONTRACT_END)
+hdd_temps <- sim_result$temperatures[hdd_indices, , drop = FALSE]
+hdd_flat <- as.vector(hdd_temps)
+
+# CDD contract period analysis
+cdd_indices <- which(sim_result$dates >= CDD_CONTRACT_START & 
+                    sim_result$dates <= CDD_CONTRACT_END)
+cdd_temps <- sim_result$temperatures[cdd_indices, , drop = FALSE]
+cdd_flat <- as.vector(cdd_temps)
+
+# Calculate days below/above strike
+days_below_strike <- apply(hdd_temps, 2, function(x) sum(x < HDD_STRIKE))
+days_above_strike <- apply(cdd_temps, 2, function(x) sum(x > CDD_STRIKE))
+
+periods_stats <- data.frame(
+  Period = c("Early Growth (HDD Contract)", "Anthesis (CDD Contract)"),
+  MeanTemp = c(mean(hdd_flat), mean(cdd_flat)),
+  MedianTemp = c(median(hdd_flat), median(cdd_flat)),
+  MinTemp = c(min(hdd_flat), min(cdd_flat)),
+  MaxTemp = c(max(hdd_flat), max(cdd_flat)),
+  CriticalDays = c(mean(days_below_strike), mean(days_above_strike)),
+  StrikeThreshold = c(HDD_STRIKE, CDD_STRIKE),
+  DegreeDaysAvg = c(
+    mean(apply(hdd_temps, 2, function(x) sum(pmax(HDD_STRIKE - x, 0)))),
+    mean(apply(cdd_temps, 2, function(x) sum(pmax(x - CDD_STRIKE, 0))))
+  ),
+  ProbThreshold = c(
+    mean(days_below_strike > 0),
+    mean(days_above_strike > 0)
+  )
+)
+
+# 1.5 Temperature by growth stage
+growth_stages_temp <- data.frame(
+  Stage = names(WHEAT_STAGES),
+  DurationDays = sapply(WHEAT_STAGES, function(x) x$days),
+  OptTempMin = sapply(WHEAT_STAGES, function(x) x$opt_temp_min),
+  OptTempMax = sapply(WHEAT_STAGES, function(x) x$opt_temp_max),
+  TempSensitivity = sapply(WHEAT_STAGES, function(x) x$temp_sensitivity),
+  AvgTemp = NA,
+  MinTemp = NA,
+  MaxTemp = NA,
+  DaysOptimal = NA,
+  DaysAboveOpt = NA,
+  DaysBelowOpt = NA
+)
+
+# Calculate cumulative days for each stage
+cum_days <- cumsum(growth_stages_temp$DurationDays)
+start_days <- c(0, cum_days[-length(cum_days)]) + 1
+end_days <- cum_days
+
+# Adjust for planting day
+start_days <- start_days + adjusted_planting_day - 1
+end_days <- end_days + adjusted_planting_day - 1
+
+# Calculate temperature statistics for each growth stage
+for (i in 1:nrow(growth_stages_temp)) {
+  # Get day range for this stage
+  stage_start <- start_days[i]
+  stage_end <- end_days[i]
+  
+  # Check if within simulation range
+  if (stage_end <= nrow(sim_result$temperatures)) {
+    # Extract temperatures for this stage
+    stage_temps <- sim_result$temperatures[stage_start:stage_end, , drop = FALSE]
+    stage_flat <- as.vector(stage_temps)
+    
+    # Calculate statistics
+    growth_stages_temp$AvgTemp[i] <- mean(stage_flat)
+    growth_stages_temp$MinTemp[i] <- min(stage_flat)
+    growth_stages_temp$MaxTemp[i] <- max(stage_flat)
+    
+    # Calculate days in different temperature ranges
+    opt_min <- growth_stages_temp$OptTempMin[i]
+    opt_max <- growth_stages_temp$OptTempMax[i]
+    
+    # For each simulation path, calculate average days in each category
+    days_optimal <- numeric(ncol(stage_temps))
+    days_above <- numeric(ncol(stage_temps))
+    days_below <- numeric(ncol(stage_temps))
+    
+    for (path in 1:ncol(stage_temps)) {
+      path_temps <- stage_temps[, path]
+      days_optimal[path] <- sum(path_temps >= opt_min & path_temps <= opt_max)
+      days_above[path] <- sum(path_temps > opt_max)
+      days_below[path] <- sum(path_temps < opt_min)
+    }
+    
+    growth_stages_temp$DaysOptimal[i] <- mean(days_optimal)
+    growth_stages_temp$DaysAboveOpt[i] <- mean(days_above)
+    growth_stages_temp$DaysBelowOpt[i] <- mean(days_below)
+  } else {
+    # Stage is partially or completely outside simulation range
+    growth_stages_temp$AvgTemp[i] <- NA
+    growth_stages_temp$MinTemp[i] <- NA
+    growth_stages_temp$MaxTemp[i] <- NA
+    growth_stages_temp$DaysOptimal[i] <- NA
+    growth_stages_temp$DaysAboveOpt[i] <- NA
+    growth_stages_temp$DaysBelowOpt[i] <- NA
+  }
+}
+
+# Save temperature analytics
+save_table(yearly_temp_stats, "yearly_temperature_stats")
+save_table(monthly_stats, "monthly_temperature_stats")
+save_table(monthly_expected_temps, "monthly_temperature_comparison")
+save_table(periods_stats, "critical_periods_stats")
+save_table(growth_stages_temp, "growth_stages_temperature")
+
+# ========== 2. WHEAT YIELD OUTCOMES ==========
+cat("\n2. Analyzing wheat yield results...\n")
+
+# 2.1 Yield distribution analysis
+yield_stats <- data.frame(
+  Metric = c(
+    "Mean Yield (tons/ha)",
+    "Median Yield (tons/ha)",
+    "Minimum Yield (tons/ha)",
+    "Maximum Yield (tons/ha)",
+    "Standard Deviation",
+    "Coefficient of Variation (%)",
+    "5th Percentile",
+    "95th Percentile",
+    "Yield Loss from Potential (%)"
+  ),
+  Value = c(
+    mean(wheat_yields),
+    median(wheat_yields),
+    min(wheat_yields),
+    max(wheat_yields),
+    sd(wheat_yields),
+    sd(wheat_yields) / mean(wheat_yields) * 100,
+    quantile(wheat_yields, 0.05),
+    quantile(wheat_yields, 0.95),
+    (1 - mean(wheat_yields) / WHEAT_BASE_YIELD) * 100
+  )
+)
+
+# 2.2 Yield distribution by quantiles
+yield_quantiles_analysis <- data.frame(
+  Quantile = c("0% (Min)", "5%", "10%", "25%", "50% (Median)", "75%", "90%", "95%", "100% (Max)"),
+  Yield = quantile(wheat_yields, probs = c(0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 1)),
+  YieldLoss = WHEAT_BASE_YIELD - quantile(wheat_yields, probs = c(0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 1)),
+  LossPercent = (1 - quantile(wheat_yields, probs = c(0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 1)) / WHEAT_BASE_YIELD) * 100
+)
+
+# 2.3 Temperature-yield correlations
+safe_cor <- function(x, y) {
+  tryCatch({
+    return(cor(x, y))
+  }, error = function(e) {
+    cat("Correlation error:", e$message, "\n")
+    return(NA)
+  })
+}
+
+temp_yield_corr <- data.frame(
+  Relationship = c(
+    "Avg Growing Season Temp vs. Yield",
+    "Anthesis Period Temp vs. Yield",
+    "Maximum Temp vs. Yield",
+    "HDD Contract Payout vs. Yield",
+    "CDD Contract Payout vs. Yield",
+    "Combined Payout vs. Yield"
+  ),
+  Correlation = c(
+    safe_cor(avg_temps, wheat_yields),
+    safe_cor(anthesis_temps, wheat_yields),
+    safe_cor(max_temps, wheat_yields),
+    safe_cor(hdd_payouts, wheat_yields),
+    safe_cor(cdd_payouts, wheat_yields),
+    safe_cor(combined_payouts, wheat_yields)
+  )
+)
+
+# Replace NAs with text explanation
+temp_yield_corr$Correlation[is.na(temp_yield_corr$Correlation)] <- "Dimension mismatch"
+
+# 2.4 Critical growth stages yield impact
+# Find the stage with most temperature stress
+if (!all(is.na(growth_stages_temp$AvgTemp))) {
+  stage_impact <- data.frame(
+    Stage = growth_stages_temp$Stage,
+    AvgTemp = growth_stages_temp$AvgTemp,
+    OptRange = paste(growth_stages_temp$OptTempMin, "-", growth_stages_temp$OptTempMax),
+    TempDeviation = abs(growth_stages_temp$AvgTemp - 
+                       (growth_stages_temp$OptTempMin + growth_stages_temp$OptTempMax) / 2),
+    Sensitivity = growth_stages_temp$TempSensitivity,
+    OptimalDays = growth_stages_temp$DaysOptimal,
+    NonOptimalDays = growth_stages_temp$DaysAboveOpt + growth_stages_temp$DaysBelowOpt,
+    StressImpact = growth_stages_temp$TempSensitivity * 
+                  (growth_stages_temp$DaysAboveOpt + growth_stages_temp$DaysBelowOpt) / 
+                  growth_stages_temp$DurationDays
+  )
+}
+
+# Save yield analytics
+save_table(yield_stats, "wheat_yield_stats")
+save_table(yield_quantiles_analysis, "yield_quantiles_analysis")
+save_table(temp_yield_corr, "temperature_yield_correlations")
+if (exists("stage_impact")) {
+  save_table(stage_impact, "growth_stage_impact")
+}
+
+# ========== 3. WEATHER DERIVATIVE CONTRACT ANALYSIS ==========
+cat("\n3. Analyzing weather derivatives results...\n")
+
+# 3.1 Contract specifications and pricing
+derivative_pricing <- data.frame(
+  Contract = c("HDD Contract (Cold)", "CDD Contract (Heat)", "Combined Portfolio"),
+  Period = c(
+    paste(format(HDD_CONTRACT_START, "%b %d"), "-", format(HDD_CONTRACT_END, "%b %d")),
+    paste(format(CDD_CONTRACT_START, "%b %d"), "-", format(CDD_CONTRACT_END, "%b %d")),
+    "Combined"
+  ),
+  StrikeLevel = c(
+    paste(HDD_STRIKE, "°C (below)"),
+    paste(CDD_STRIKE, "°C (above)"),
+    "Multiple"
+  ),
+  TickSize = c(
+    paste(HDD_TICK_SIZE, "CHF/HDD"),
+    paste(CDD_TICK_SIZE, "CHF/CDD"),
+    "Multiple"
+  ),
+  FairPrice = c(
+    hdd_derivative$price,
+    cdd_derivative$price,
+    hdd_cost + cdd_cost
+  ),
+  EffectivePrice = c(
+    hdd_derivative$price * HEDGE_RATIO,
+    cdd_derivative$price * HEDGE_RATIO,
+    total_derivative_cost * HEDGE_RATIO
+  ),
+  AveragePayout = c(
+    mean(hdd_payouts),
+    mean(cdd_payouts),
+    mean(combined_payouts)
+  ),
+  MaxPayout = c(
+    HDD_MAX_PAYOUT,
+    CDD_MAX_PAYOUT,
+    HDD_MAX_PAYOUT + CDD_MAX_PAYOUT
+  ),
+  ExpectedPayoffRatio = c(
+    mean(hdd_payouts) / hdd_derivative$price,
+    mean(cdd_payouts) / cdd_derivative$price,
+    mean(combined_payouts) / (hdd_cost + cdd_cost)
+  )
+)
+
+# 3.2 Yield loss correlations
+yield_loss_correlations <- c(
+  safe_cor(hdd_payouts, yield_losses),
+  safe_cor(cdd_payouts, yield_losses),
+  safe_cor(combined_payouts, yield_losses)
+)
+
+# Add to derivative summary if correlations are valid
+if (!any(is.na(yield_loss_correlations))) {
+  derivative_pricing$YieldLossCorrelation <- yield_loss_correlations
+}
+
+# 3.3 Payout distribution
+payout_distribution <- data.frame(
+  Percentile = c("0% (Min)", "5%", "10%", "25%", "50% (Median)", "75%", "90%", "95%", "100% (Max)"),
+  HDDPayout = as.numeric(round(quantile(hdd_payouts, c(0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 1)), 2)),
+  CDDPayout = as.numeric(round(quantile(cdd_payouts, c(0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 1)), 2)),
+  CombinedPayout = as.numeric(round(quantile(combined_payouts, c(0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 1)), 2)),
+  EffectivePayout = as.numeric(round(quantile(combined_payouts, c(0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 1)) * HEDGE_RATIO, 2))
+)
+
+# 3.4 Degree day accumulation analysis
+hdd_accum_stats <- data.frame(
+  Statistic = c("Mean", "Median", "Min", "Max", "Std Dev", "CV (%)", "5th Pctl", "95th Pctl"),
+  Value = c(
+    mean(hdd_derivative$accumulated_hdds),
+    median(hdd_derivative$accumulated_hdds),
+    min(hdd_derivative$accumulated_hdds),
+    max(hdd_derivative$accumulated_hdds),
+    sd(hdd_derivative$accumulated_hdds),
+    sd(hdd_derivative$accumulated_hdds) / mean(hdd_derivative$accumulated_hdds) * 100,
+    quantile(hdd_derivative$accumulated_hdds, 0.05),
+    quantile(hdd_derivative$accumulated_hdds, 0.95)
+  )
+)
+
+cdd_accum_stats <- data.frame(
+  Statistic = c("Mean", "Median", "Min", "Max", "Std Dev", "CV (%)", "5th Pctl", "95th Pctl"),
+  Value = c(
+    mean(cdd_derivative$accumulated_cdds),
+    median(cdd_derivative$accumulated_cdds),
+    min(cdd_derivative$accumulated_cdds),
+    max(cdd_derivative$accumulated_cdds),
+    sd(cdd_derivative$accumulated_cdds),
+    sd(cdd_derivative$accumulated_cdds) / mean(cdd_derivative$accumulated_cdds) * 100,
+    quantile(cdd_derivative$accumulated_cdds, 0.05),
+    quantile(cdd_derivative$accumulated_cdds, 0.95)
+  )
+)
+
+# 3.5 Trigger probability analysis
+trigger_analysis <- data.frame(
+  Contract = c("HDD Contract", "CDD Contract", "Either Contract", "Both Contracts"),
+  TriggerProbability = c(
+    mean(hdd_payouts > 0),
+    mean(cdd_payouts > 0),
+    mean(hdd_payouts > 0 | cdd_payouts > 0),
+    mean(hdd_payouts > 0 & cdd_payouts > 0)
+  ),
+  MaxPayoutProbability = c(
+    mean(hdd_payouts >= HDD_MAX_PAYOUT),
+    mean(cdd_payouts >= CDD_MAX_PAYOUT),
+    NA,
+    NA
+  ),
+  AvgPayoutWhenTriggered = c(
+    ifelse(sum(hdd_payouts > 0) > 0, mean(hdd_payouts[hdd_payouts > 0]), NA),
+    ifelse(sum(cdd_payouts > 0) > 0, mean(cdd_payouts[cdd_payouts > 0]), NA),
+    ifelse(sum(hdd_payouts > 0 | cdd_payouts > 0) > 0, 
+          mean((hdd_payouts + cdd_payouts)[hdd_payouts > 0 | cdd_payouts > 0]), NA),
+    ifelse(sum(hdd_payouts > 0 & cdd_payouts > 0) > 0, 
+          mean((hdd_payouts + cdd_payouts)[hdd_payouts > 0 & cdd_payouts > 0]), NA)
+  )
+)
+
+# Save derivatives analytics
+save_table(derivative_pricing, "derivative_contract_summary")
+save_table(payout_distribution, "derivative_payout_distribution")
+save_table(hdd_accum_stats, "hdd_accumulation_statistics")
+save_table(cdd_accum_stats, "cdd_accumulation_statistics")
+save_table(trigger_analysis, "derivative_trigger_analysis")
+
+# ========== 4. FINANCIAL OUTCOMES COMPARISON ==========
+cat("\n4. Analyzing farmer earnings results...\n")
+
+# 4.1 Earnings comparison
+earnings_comparison <- data.frame(
+  Metric = c(
+    "Mean Earnings (CHF)",
+    "Median Earnings (CHF)",
+    "Minimum Earnings (CHF)",
+    "Maximum Earnings (CHF)",
+    "Standard Deviation (CHF)",
+    "Coefficient of Variation (%)",
+    "5% Value at Risk (CHF)",
+    "10% Value at Risk (CHF)",
+    "Probability of Negative Earnings (%)"
+  ),
+  WithoutDerivatives = c(
+    mean(earnings_without_derivative),
+    median(earnings_without_derivative),
+    min(earnings_without_derivative),
+    max(earnings_without_derivative),
+    sd(earnings_without_derivative),
+    sd(earnings_without_derivative) / abs(mean(earnings_without_derivative)) * 100,
+    quantile(earnings_without_derivative, 0.05),
+    quantile(earnings_without_derivative, 0.1),
+    mean(earnings_without_derivative < 0) * 100
+  ),
+  WithDerivatives = c(
+    mean(earnings_with_derivative),
+    median(earnings_with_derivative),
+    min(earnings_with_derivative),
+    max(earnings_with_derivative),
+    sd(earnings_with_derivative),
+    sd(earnings_with_derivative) / abs(mean(earnings_with_derivative)) * 100,
+    quantile(earnings_with_derivative, 0.05),
+    quantile(earnings_with_derivative, 0.1),
+    mean(earnings_with_derivative < 0) * 100
+  ),
+  AbsoluteChange = c(
+    mean(earnings_with_derivative) - mean(earnings_without_derivative),
+    median(earnings_with_derivative) - median(earnings_without_derivative),
+    min(earnings_with_derivative) - min(earnings_without_derivative),
+    max(earnings_with_derivative) - max(earnings_without_derivative),
+    sd(earnings_without_derivative) - sd(earnings_with_derivative),
+    sd(earnings_without_derivative) / abs(mean(earnings_without_derivative)) * 100 - 
+      sd(earnings_with_derivative) / abs(mean(earnings_with_derivative)) * 100,
+    quantile(earnings_with_derivative, 0.05) - quantile(earnings_without_derivative, 0.05),
+    quantile(earnings_with_derivative, 0.1) - quantile(earnings_without_derivative, 0.1),
+    (mean(earnings_without_derivative < 0) - mean(earnings_with_derivative < 0)) * 100
+  ),
+  PercentChange = c(
+    round((mean(earnings_with_derivative) / mean(earnings_without_derivative) - 1) * 100, 1),
+    round((median(earnings_with_derivative) / median(earnings_without_derivative) - 1) * 100, 1),
+    ifelse(min(earnings_without_derivative) < 0 & min(earnings_with_derivative) < 0,
+           round((min(earnings_with_derivative) / min(earnings_without_derivative) - 1) * 100, 1),
+           NA),
+    round((max(earnings_with_derivative) / max(earnings_without_derivative) - 1) * 100, 1),
+    round((1 - sd(earnings_with_derivative) / sd(earnings_without_derivative)) * 100, 1),
+    NA,
+    ifelse(quantile(earnings_without_derivative, 0.05) != 0,
+           round((quantile(earnings_with_derivative, 0.05) / quantile(earnings_without_derivative, 0.05) - 1) * 100, 1),
+           NA),
+    ifelse(quantile(earnings_without_derivative, 0.1) != 0,
+           round((quantile(earnings_with_derivative, 0.1) / quantile(earnings_without_derivative, 0.1) - 1) * 100, 1),
+           NA),
+    NA
+  )
+)
+
+# 4.2 Hedging effectiveness metrics
+hedging_metrics <- data.frame(
+  Metric = c(
+    "Mean Earnings Impact",
+    "Earnings Volatility Reduction",
+    "5% VaR Improvement",
+    "10% VaR Improvement",
+    "Worst-Case Scenario Improvement",
+    "Derivative Cost (Hedge Ratio Applied)",
+    "Average Payout (Hedge Ratio Applied)",
+    "Net Cost/Benefit",
+    "Return on Derivative Investment"
+  ),
+  Value = c(
+    mean(earnings_with_derivative) - mean(earnings_without_derivative),
+    (1 - sd(earnings_with_derivative) / sd(earnings_without_derivative)) * 100,
+    quantile(earnings_with_derivative, 0.05) - quantile(earnings_without_derivative, 0.05),
+    quantile(earnings_with_derivative, 0.1) - quantile(earnings_without_derivative, 0.1),
+    min(earnings_with_derivative) - min(earnings_without_derivative),
+    total_derivative_cost * HEDGE_RATIO,
+    mean(combined_payouts) * HEDGE_RATIO,
+    mean(earnings_with_derivative) - mean(earnings_without_derivative),
+    (mean(combined_payouts) * HEDGE_RATIO - total_derivative_cost * HEDGE_RATIO) / 
+      (total_derivative_cost * HEDGE_RATIO) * 100
+  ),
+  Unit = c(
+    "CHF",
+    "%",
+    "CHF",
+    "CHF",
+    "CHF",
+    "CHF",
+    "CHF",
+    "CHF",
+    "%"
+  )
+)
+
+# Add yield loss correlation if valid
+if (!is.na(safe_cor(yield_losses, combined_payouts))) {
+  hedging_metrics <- rbind(hedging_metrics, 
+                         data.frame(
+                           Metric = "Yield Loss-Payout Correlation",
+                           Value = safe_cor(yield_losses, combined_payouts),
+                           Unit = "correlation coefficient"
+                         ))
+}
+
+# 4.3 Yield-stratified earnings analysis
+# Create yield groups (quintiles)
+yield_breaks <- quantile(wheat_yields, probs = seq(0, 1, 0.2))
+earnings_by_yield <- data.frame()
+
+for (i in 1:5) {
+  min_yield <- yield_breaks[i]
+  max_yield <- yield_breaks[i+1]
+  
+  # Find yields in this range
+  indices <- which(wheat_yields >= min_yield & wheat_yields <= max_yield)
+  
+  if (length(indices) > 0) {
+    # Calculate metrics for this range
+    avg_yield <- mean(wheat_yields[indices])
+    yield_loss <- WHEAT_BASE_YIELD - avg_yield
+    yield_loss_pct <- (1 - avg_yield / WHEAT_BASE_YIELD) * 100
+    
+    avg_without <- mean(earnings_without_derivative[indices])
+    avg_with <- mean(earnings_with_derivative[indices])
+    avg_hdd_payout <- mean(hdd_payouts[indices] * HEDGE_RATIO)
+    avg_cdd_payout <- mean(cdd_payouts[indices] * HEDGE_RATIO)
+    avg_total_payout <- mean(combined_payouts[indices] * HEDGE_RATIO)
+    avg_cost <- total_derivative_cost * HEDGE_RATIO
+    
+    # Add to data frame
+    earnings_by_yield <- rbind(earnings_by_yield, data.frame(
+      YieldQuintile = i,
+      YieldRange = paste(round(min_yield, 2), "-", round(max_yield, 2)),
+      AvgYield = avg_yield,
+      YieldLoss = yield_loss,
+      YieldLossPct = yield_loss_pct,
+      EarningsWithout = avg_without,
+      EarningsWith = avg_with,
+      HDDPayout = avg_hdd_payout,
+      CDDPayout = avg_cdd_payout,
+      TotalPayout = avg_total_payout,
+      DerivativeCost = avg_cost,
+      NetBenefit = avg_with - avg_without,
+      NetPayoutVsCost = avg_total_payout - avg_cost,
+      ROI = (avg_total_payout - avg_cost) / avg_cost * 100
+    ))
+  }
+}
+
+# 4.4 Extreme scenario analysis
+# Identify worst 5% of scenarios in terms of yield
+worst_yield_indices <- which(wheat_yields <= quantile(wheat_yields, 0.05))
+best_yield_indices <- which(wheat_yields >= quantile(wheat_yields, 0.95))
+
+# Analyze these extreme scenarios
+extreme_scenarios <- data.frame(
+  Scenario = c("Worst 5% Yield Cases", "Best 5% Yield Cases"),
+  AvgYield = c(
+    mean(wheat_yields[worst_yield_indices]),
+    mean(wheat_yields[best_yield_indices])
+  ),
+  YieldLoss = c(
+    WHEAT_BASE_YIELD - mean(wheat_yields[worst_yield_indices]),
+    WHEAT_BASE_YIELD - mean(wheat_yields[best_yield_indices])
+  ),
+  AvgTemp = c(
+    mean(avg_temps[worst_yield_indices]),
+    mean(avg_temps[best_yield_indices])
+  ),
+  AnthesisTemp = c(
+    mean(anthesis_temps[worst_yield_indices]),
+    mean(anthesis_temps[best_yield_indices])
+  ),
+  MaxTemp = c(
+    mean(max_temps[worst_yield_indices]),
+    mean(max_temps[best_yield_indices])
+  ),
+  HDDPayout = c(
+    mean(hdd_payouts[worst_yield_indices]) * HEDGE_RATIO,
+    mean(hdd_payouts[best_yield_indices]) * HEDGE_RATIO
+  ),
+  CDDPayout = c(
+    mean(cdd_payouts[worst_yield_indices]) * HEDGE_RATIO,
+    mean(cdd_payouts[best_yield_indices]) * HEDGE_RATIO
+  ),
+  TotalPayout = c(
+    mean(combined_payouts[worst_yield_indices]) * HEDGE_RATIO,
+    mean(combined_payouts[best_yield_indices]) * HEDGE_RATIO
+  ),
+  EarningsWithout = c(
+    mean(earnings_without_derivative[worst_yield_indices]),
+    mean(earnings_without_derivative[best_yield_indices])
+  ),
+  EarningsWith = c(
+    mean(earnings_with_derivative[worst_yield_indices]),
+    mean(earnings_with_derivative[best_yield_indices])
+  ),
+  NetBenefit = c(
+    mean(earnings_with_derivative[worst_yield_indices] - earnings_without_derivative[worst_yield_indices]),
+    mean(earnings_with_derivative[best_yield_indices] - earnings_without_derivative[best_yield_indices])
+  )
+)
+
+# 4.5 Cost-benefit analysis at different hedge ratios
+hedge_ratios <- seq(0, 1, 0.1)
+hedge_ratio_analysis <- data.frame(
+  HedgeRatio = hedge_ratios,
+  MeanEarnings = numeric(length(hedge_ratios)),
+  EarningsStdDev = numeric(length(hedge_ratios)),
+  VaR5Pct = numeric(length(hedge_ratios)),
+  MinEarnings = numeric(length(hedge_ratios)),
+  DerivativeCost = numeric(length(hedge_ratios)),
+  AveragePayout = numeric(length(hedge_ratios)),
+  NetReturn = numeric(length(hedge_ratios)),
+  ROI = numeric(length(hedge_ratios))
+)
+
+for (i in 1:length(hedge_ratios)) {
+  ratio <- hedge_ratios[i]
+  
+  # Calculate earnings with this hedge ratio
+  payouts <- combined_payouts * ratio
+  cost <- total_derivative_cost * ratio
+  earnings <- earnings_without_derivative + payouts - cost
+  
+  # Store results
+  hedge_ratio_analysis$MeanEarnings[i] <- mean(earnings)
+  hedge_ratio_analysis$EarningsStdDev[i] <- sd(earnings)
+  hedge_ratio_analysis$VaR5Pct[i] <- quantile(earnings, 0.05)
+  hedge_ratio_analysis$MinEarnings[i] <- min(earnings)
+  hedge_ratio_analysis$DerivativeCost[i] <- total_derivative_cost * ratio
+  hedge_ratio_analysis$AveragePayout[i] <- mean(combined_payouts) * ratio
+  hedge_ratio_analysis$NetReturn[i] <- mean(earnings) - mean(earnings_without_derivative)
+  if (ratio > 0) {
+    hedge_ratio_analysis$ROI[i] <- (mean(combined_payouts) * ratio - total_derivative_cost * ratio) / 
+                                   (total_derivative_cost * ratio) * 100
+  } else {
+    hedge_ratio_analysis$ROI[i] <- NA
+  }
+}
+
+# Save financial outcomes analysis
+save_table(earnings_comparison, "earnings_comparison")
+save_table(hedging_metrics, "hedging_effectiveness_metrics")
+save_table(earnings_by_yield, "earnings_by_yield_level")
+save_table(extreme_scenarios, "extreme_yield_scenarios")
+save_table(hedge_ratio_analysis, "hedge_ratio_analysis")
+
+# ========== ADDITIONAL TABLES FOR COMPREHENSIVE CHAPTER 4 ==========
+
+# 1. Summary of all key simulation parameters
+simulation_parameters <- data.frame(
+  Category = c(
+    "Temperature Model", "Temperature Model", "Temperature Model", "Temperature Model", "Temperature Model",
+    "Wheat Growth Model", "Wheat Growth Model", "Wheat Growth Model", "Wheat Growth Model", 
+    "Weather Derivatives", "Weather Derivatives", "Weather Derivatives", "Weather Derivatives", 
+    "Weather Derivatives", "Weather Derivatives", "Weather Derivatives", "Weather Derivatives",
+    "Economic Model", "Economic Model", "Economic Model", "Economic Model"
+  ),
+  Parameter = c(
+    "Mean Temperature (A)", "Temperature Trend (B)", "Seasonal Amplitude (C)", "Phase Shift (phi)", "Mean Reversion (a)",
+    "Base Yield", "Optimal Temperature Range", "Heat Stress Threshold", "Frost Threshold",
+    "HDD Contract Period", "HDD Strike Temperature", "HDD Tick Size", "HDD Maximum Payout",
+    "CDD Contract Period", "CDD Strike Temperature", "CDD Tick Size", "CDD Maximum Payout",
+    "Wheat Price", "Production Cost", "Farm Size", "Hedge Ratio"
+  ),
+  Value = c(
+    paste(round(params$A, 2), "°C"),
+    paste(round(params$B * 365, 6), "°C/year"),
+    paste(round(params$C, 2), "°C"),
+    paste(round(params$phi, 4), "radians"),
+    round(params$a, 4),
+    paste(WHEAT_BASE_YIELD, "tons/ha"),
+    paste(OPTIMAL_TEMP_MIN, "-", OPTIMAL_TEMP_MAX, "°C"),
+    paste(HEAT_STRESS_THRESHOLD, "°C"),
+    paste(FROST_THRESHOLD, "°C"),
+    paste(format(HDD_CONTRACT_START, "%b %d"), "-", format(HDD_CONTRACT_END, "%b %d")),
+    paste(HDD_STRIKE, "°C"),
+    paste(HDD_TICK_SIZE, "CHF/HDD"),
+    paste(HDD_MAX_PAYOUT, "CHF"),
+    paste(format(CDD_CONTRACT_START, "%b %d"), "-", format(CDD_CONTRACT_END, "%b %d")),
+    paste(CDD_STRIKE, "°C"),
+    paste(CDD_TICK_SIZE, "CHF/CDD"),
+    paste(CDD_MAX_PAYOUT, "CHF"),
+    paste(WHEAT_PRICE_PER_TON, "CHF/ton"),
+    paste(PRODUCTION_COST_PER_HECTARE, "CHF/ha"),
+    paste(FARM_SIZE_HECTARES, "ha"),
+    paste(HEDGE_RATIO * 100, "%")
+  )
+)
+
+# 2. Combined key results summary table
+key_results_summary <- data.frame(
+  Category = c(
+    "Temperature", "Temperature", "Temperature", "Temperature",
+    "Wheat Yield", "Wheat Yield", "Wheat Yield", "Wheat Yield",
+    "Derivatives", "Derivatives", "Derivatives", "Derivatives",
+    "Financial Outcomes", "Financial Outcomes", "Financial Outcomes", "Financial Outcomes"
+  ),
+  Metric = c(
+    "Annual Mean Temperature", "Days Below HDD Strike", "Days Above CDD Strike", "Anthesis Period Mean Temperature",
+    "Mean Yield", "Yield Loss from Potential", "Minimum Yield", "Yield-Temp Correlation",
+    "HDD Contract Price", "CDD Contract Price", "Average Combined Payout", "Yield Loss-Payout Correlation",
+    "Mean Earnings Without Derivatives", "Mean Earnings With Derivatives", "Earnings Volatility Reduction", "VaR Improvement"
+  ),
+  Value = c(
+    paste(round(yearly_temp_stats$Value[1], 1), "°C"),
+    round(yearly_temp_stats$Value[8], 1),
+    round(yearly_temp_stats$Value[9], 1),
+    paste(round(periods_stats$MeanTemp[2], 1), "°C"),
+    paste(round(mean(wheat_yields), 2), "tons/ha"),
+    paste(round((1 - mean(wheat_yields)/WHEAT_BASE_YIELD) * 100, 1), "%"),
+    paste(round(min(wheat_yields), 2), "tons/ha"),
+    as.character(temp_yield_corr$Correlation[which.max(abs(as.numeric(temp_yield_corr$Correlation[1:3])))]),
+    paste(round(hdd_derivative$price, 2), "CHF"),
+    paste(round(cdd_derivative$price, 2), "CHF"),
+    paste(round(mean(combined_payouts) * HEDGE_RATIO, 2), "CHF"),
+    ifelse(!is.na(yield_loss_correlations[3]), round(yield_loss_correlations[3], 3), "NA"),
+    paste(round(mean(earnings_without_derivative)), "CHF"),
+    paste(round(mean(earnings_with_derivative)), "CHF"),
+    paste(round((1 - sd(earnings_with_derivative)/sd(earnings_without_derivative)) * 100, 1), "%"),
+    paste(round(quantile(earnings_with_derivative, 0.05) - quantile(earnings_without_derivative, 0.05)), "CHF")
+  )
+)
+
+# Save additional tables
+save_table(simulation_parameters, "simulation_parameters")
+save_table(key_results_summary, "key_results_summary")
+
+# ========== SUMMARY OF KEY FINDINGS ==========
+cat("\n========== SUMMARY OF KEY FINDINGS ==========\n")
+
+cat("1. TEMPERATURE ANALYSIS:\n")
+cat("   - Annual average temperature:", round(yearly_temp_stats$Value[1], 1), "°C\n")
+cat("   - Warmest month:", monthly_stats$Month[which.max(monthly_stats$MeanTemp)], 
+    "at", round(max(monthly_stats$MeanTemp), 1), "°C\n")
+cat("   - Coldest month:", monthly_stats$Month[which.min(monthly_stats$MeanTemp)], 
+    "at", round(min(monthly_stats$MeanTemp), 1), "°C\n")
+cat("   - Average temperature in HDD contract period:", round(periods_stats$MeanTemp[1], 1), "°C\n")
+cat("   - Average temperature in CDD contract period:", round(periods_stats$MeanTemp[2], 1), "°C\n")
+cat("   - Average HDD accumulation:", round(mean(hdd_derivative$accumulated_hdds), 1), "degree days\n")
+cat("   - Average CDD accumulation:", round(mean(cdd_derivative$accumulated_cdds), 1), "degree days\n\n")
+
+cat("2. WHEAT YIELD OUTCOMES:\n")
+cat("   - Mean yield:", round(yield_stats$Value[1], 2), "tons/ha\n")
+cat("   - Yield loss from potential:", round(yield_stats$Value[9], 1), "%\n")
+cat("   - Yield range:", round(min(wheat_yields), 2), "to", round(max(wheat_yields), 2), "tons/ha\n")
+if (!all(is.na(growth_stages_temp$AvgTemp))) {
+  most_stress_stage <- growth_stages_temp$Stage[which.max(growth_stages_temp$DaysAboveOpt + growth_stages_temp$DaysBelowOpt)]
+  cat("   - Most temperature stress during:", most_stress_stage, "stage\n\n")
+}
+
+cat("3. WEATHER DERIVATIVES ANALYSIS:\n")
+cat("   - HDD contract price:", round(hdd_derivative$price, 2), "CHF\n")
+cat("   - CDD contract price:", round(cdd_derivative$price, 2), "CHF\n")
+cat("   - HDD contract trigger probability:", round(mean(hdd_payouts > 0) * 100, 1), "%\n")
+cat("   - CDD contract trigger probability:", round(mean(cdd_payouts > 0) * 100, 1), "%\n")
+cat("   - Average HDD payout when triggered:", 
+    ifelse(sum(hdd_payouts > 0) > 0, round(mean(hdd_payouts[hdd_payouts > 0])), "N/A"), "CHF\n")
+cat("   - Average CDD payout when triggered:", 
+    ifelse(sum(cdd_payouts > 0) > 0, round(mean(cdd_payouts[cdd_payouts > 0])), "N/A"), "CHF\n\n")
+
+cat("4. FINANCIAL OUTCOMES COMPARISON:\n")
+cat("   - Mean earnings without derivatives:", round(mean(earnings_without_derivative)), "CHF\n")
+cat("   - Mean earnings with derivatives:", round(mean(earnings_with_derivative)), "CHF\n")
+cat("   - Earnings volatility reduction:", 
+    round((1 - sd(earnings_with_derivative)/sd(earnings_without_derivative)) * 100, 1), "%\n")
+cat("   - VaR improvement:", 
+    round(quantile(earnings_with_derivative, 0.05) - quantile(earnings_without_derivative, 0.05)), "CHF\n")
+cat("   - Worst-case scenario improvement:", 
+    round(min(earnings_with_derivative) - min(earnings_without_derivative)), "CHF\n")
+if (nrow(earnings_by_yield) > 0) {
+  cat("   - Most benefit in yield range:", 
+      earnings_by_yield$YieldRange[which.max(earnings_by_yield$NetBenefit)], "tons/ha\n")
+}
+
+cat("\nAll analysis results have been saved to the 'analytics' directory.\n")
+cat("=================================================\n")
+```
+
+```{r threshold analysis}
+# ========== TEMPERATURE THRESHOLD ANALYSIS ==========
+cat("\nAnalyzing temperature thresholds in the simulation...\n")
+
+# Create a function to analyze temperature thresholds
+analyze_temperature_thresholds <- function(sim_result, thresholds = c(22, 24, 26, 28, 30)) {
+  # Extract simulation dates and temperature matrix
+  dates <- sim_result$dates
+  temps_matrix <- sim_result$temperatures
+  n_paths <- ncol(temps_matrix)
+  
+  # Initialize results dataframe
+  threshold_stats <- data.frame(
+    Threshold = thresholds,
+    AnnualDaysAbove = numeric(length(thresholds)),
+    MaxConsecutiveDays = numeric(length(thresholds)),
+    MonthlyDistribution = character(length(thresholds)),
+    CriticalPeriodDays = numeric(length(thresholds))
+  )
+  
+  # Define critical growth period (anthesis + grain filling)
+  critical_start <- which(dates >= CDD_CONTRACT_START)[1]
+  critical_end <- which(dates <= CDD_CONTRACT_END)[length(which(dates <= CDD_CONTRACT_END))]
+  critical_period <- critical_start:critical_end
+  
+  # For each threshold, calculate statistics
+  for (i in 1:length(thresholds)) {
+    threshold <- thresholds[i]
+    
+    # Calculate days above threshold for each simulation path
+    days_above <- apply(temps_matrix, 2, function(x) x > threshold)
+    annual_days_above <- colSums(days_above)
+    
+    # Calculate average number of days above threshold annually
+    threshold_stats$AnnualDaysAbove[i] <- mean(annual_days_above)
+    
+    # Calculate maximum consecutive days above threshold
+    max_consecutive <- numeric(n_paths)
+    for (path in 1:n_paths) {
+      consecutive_count <- 0
+      max_count <- 0
+      for (day in 1:nrow(temps_matrix)) {
+        if (temps_matrix[day, path] > threshold) {
+          consecutive_count <- consecutive_count + 1
+          max_count <- max(max_count, consecutive_count)
+        } else {
+          consecutive_count <- 0
+        }
+      }
+      max_consecutive[path] <- max_count
+    }
+    threshold_stats$MaxConsecutiveDays[i] <- mean(max_consecutive)
+    
+    # Calculate monthly distribution
+    monthly_counts <- numeric(12)
+    for (m in 1:12) {
+      month_indices <- which(month(dates) == m)
+      if (length(month_indices) > 0) {
+        monthly_days_above <- apply(temps_matrix[month_indices, , drop = FALSE], 2, 
+                                   function(x) sum(x > threshold))
+        monthly_counts[m] <- mean(monthly_days_above)
+      }
+    }
+    
+    # Format monthly distribution to show top 3 months
+    month_names <- month.abb
+    month_data <- data.frame(Month = month_names, Count = monthly_counts)
+    top_months <- month_data[order(-month_data$Count), ][1:3, ]
+    threshold_stats$MonthlyDistribution[i] <- paste(
+      paste(top_months$Month, round(top_months$Count, 1), sep=": "), 
+      collapse=", "
+    )
+    
+    # Calculate days above threshold during critical period
+    if (length(critical_period) > 0) {
+      critical_days_above <- apply(temps_matrix[critical_period, , drop = FALSE], 2, 
+                                  function(x) sum(x > threshold))
+      threshold_stats$CriticalPeriodDays[i] <- mean(critical_days_above)
+    } else {
+      threshold_stats$CriticalPeriodDays[i] <- NA
+    }
+  }
+  
+  return(threshold_stats)
+}
+
+# Run the analysis
+threshold_analysis <- analyze_temperature_thresholds(sim_result)
+
+# Print the results
+cat("\n========== TEMPERATURE THRESHOLD ANALYSIS ==========\n")
+cat("CDD Contract Period:", format(CDD_CONTRACT_START, "%b %d"), "-", format(CDD_CONTRACT_END, "%b %d"), "\n")
+cat("CDD Strike Temperature:", CDD_STRIKE, "°C\n\n")
+
+print(threshold_analysis)
+
+# Create more detailed analysis for the CDD strike temperature
+cdd_threshold <- CDD_STRIKE
+cdd_days_above <- apply(sim_result$temperatures, 2, function(x) x > cdd_threshold)
+paths_with_zero_days <- sum(colSums(cdd_days_above) == 0)
+paths_with_days_above <- sum(colSums(cdd_days_above) > 0)
+
+# Define the critical period indices
+critical_indices <- which(sim_result$dates >= CDD_CONTRACT_START & sim_result$dates <= CDD_CONTRACT_END)
+cdd_critical_days_above <- apply(sim_result$temperatures[critical_indices, , drop = FALSE], 2, 
+                                function(x) sum(x > cdd_threshold))
+critical_paths_with_zero <- sum(cdd_critical_days_above == 0)
+critical_paths_with_days_above <- sum(cdd_critical_days_above > 0)
+
+cat("\n========== DETAILED CDD STRIKE ANALYSIS ==========\n")
+cat("CDD Strike Temperature:", cdd_threshold, "°C\n")
+cat("Percentage of simulation paths with NO days above strike:", 
+    round(paths_with_zero_days/n_paths*100, 1), "%\n")
+cat("Percentage of simulation paths with at least one day above strike:", 
+    round(paths_with_days_above/n_paths*100, 1), "%\n")
+cat("Average days per year above strike:", round(mean(colSums(cdd_days_above)), 1), "days\n\n")
+
+cat("DURING CRITICAL PERIOD (CDD CONTRACT PERIOD):\n")
+cat("Percentage of simulation paths with NO days above strike:", 
+    round(critical_paths_with_zero/n_paths*100, 1), "%\n")
+cat("Percentage of simulation paths with at least one day above strike:", 
+    round(critical_paths_with_days_above/n_paths*100, 1), "%\n")
+cat("Average days during contract period above strike:", round(mean(cdd_critical_days_above), 1), "days\n")
+
+# Test different potential strike thresholds
+alternative_strikes <- c(18, 20, 22, 24, 26)
+alt_strike_data <- data.frame(
+  Strike = alternative_strikes,
+  AvgDaysAbove = numeric(length(alternative_strikes)),
+  PctSimsWithDays = numeric(length(alternative_strikes)),
+  YieldCorrelation = numeric(length(alternative_strikes))
+)
+
+for (i in 1:length(alternative_strikes)) {
+  strike <- alternative_strikes[i]
+  
+  # Calculate days above this strike in critical period
+  days_above <- apply(sim_result$temperatures[critical_indices, , drop = FALSE], 2, 
+                     function(x) sum(x > strike))
+  
+  # Calculate average days and percentage of sims with days above
+  alt_strike_data$AvgDaysAbove[i] <- mean(days_above)
+  alt_strike_data$PctSimsWithDays[i] <- mean(days_above > 0) * 100
+  
+  # Calculate hypothetical payout and correlation with yield loss
+  tick_size <- CDD_TICK_SIZE  # Use the same tick size as original
+  max_payout <- CDD_MAX_PAYOUT  # Use the same max payout as original
+  
+  # Simple payout calculation (actual pricing would be more complex)
+  payouts <- pmin(days_above * tick_size, max_payout)
+  alt_strike_data$YieldCorrelation[i] <- cor(payouts, yield_losses)
+}
+
+cat("\n========== ALTERNATIVE CDD STRIKE ANALYSIS ==========\n")
+print(alt_strike_data)
+cat("\nThis analysis suggests optimal strike level for better correlation with yield losses\n")
+cat("=======================================================\n")
+
+# Save this analysis
+if (dir.exists(analytics_dir)) {
+  write.csv(threshold_analysis, file.path(analytics_dir, "temperature_threshold_analysis.csv"), row.names = FALSE)
+  write.csv(alt_strike_data, file.path(analytics_dir, "alternative_cdd_strikes.csv"), row.names = FALSE)
+}
+```
+
+```{r code}
+
+```
+
+```{r code}
+
+```
+
+```{r code}
+
+```
